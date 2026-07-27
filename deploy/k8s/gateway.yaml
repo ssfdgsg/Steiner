@@ -1,0 +1,85 @@
+# K8s 部署清单：ConfigMap（网关配置）+ Deployment + Service。
+# 后端地址请按集群内推理服务的 Service 名修改。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-gateway-config
+  labels: { app: ai-gateway }
+data:
+  gateway.yaml: |
+    server:
+      listen: ":8080"
+    metrics:
+      scrape_interval: 2s
+    session:
+      enabled: true
+    queue:
+      enabled: true
+    kv_cache:
+      enabled: true
+    prometheus:
+      url: "http://prometheus.monitoring:9090"
+      queries:
+        - name: gpu_util
+          query: 'avg by (instance) (DCGM_FI_DEV_GPU_UTIL)'
+          backend_label: instance
+    backends:
+      - { id: vllm-0,   engine: vllm,   url: "http://vllm-0.vllm.default.svc:8000" }
+      - { id: vllm-1,   engine: vllm,   url: "http://vllm-1.vllm.default.svc:8000" }
+      - { id: sglang-0, engine: sglang, url: "http://sglang-0.sglang.default.svc:30000" }
+    models:
+      - name: "*"
+        backends: [vllm-0, vllm-1, sglang-0]
+        strategy: expression
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-gateway
+  labels: { app: ai-gateway }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: ai-gateway }
+  template:
+    metadata:
+      labels: { app: ai-gateway }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: gateway
+          image: ai-gateway:latest   # 由 deploy/docker/Dockerfile 构建
+          args: ["-config", "/etc/ai-gateway/gateway.yaml"]
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ai-gateway
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 500m, memory: 256Mi }
+            limits: { cpu: "2", memory: 1Gi }
+      volumes:
+        - name: config
+          configMap: { name: ai-gateway-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-gateway
+  labels: { app: ai-gateway }
+spec:
+  selector: { app: ai-gateway }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

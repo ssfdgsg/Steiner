@@ -1,0 +1,213 @@
+# ai-gateway 全量配置示例（字段与 internal/config/config.go 一一对应）
+
+server:
+  listen: ":8080"                    # 业务、指标与管理接口共用端口
+  max_body_bytes: 33554432           # 32MiB；多模态(omni)请求体较大，按需调高
+  retries: 2                         # 未写出任何字节前的换后端重试次数
+  upstream_connect_timeout: 3s
+  upstream_response_timeout: 120s    # 等待响应头超时，流式响应体不受限
+  failure_threshold: 3               # 连续失败 N 次被动摘除后端
+  eject_cooldown: 15s                # 摘除冷却期，到期自动恢复参与调度
+
+metrics:
+  scrape_interval: 2s                # 直采后端 /metrics 周期
+  scrape_timeout: 2s
+  health_interval: 5s                # 主动健康检查周期
+  health_timeout: 2s
+
+prometheus:                          # 外部 Prometheus 旁路查询（url 为空则不启用）
+  url: http://prometheus:9090
+  interval: 10s
+  timeout: 5s
+  queries:
+    - name: gpu_util                 # 表达式中以 vars["gpu_util"] 引用
+      query: 'avg by (instance) (DCGM_FI_DEV_GPU_UTIL)'
+      backend_label: instance        # 该标签值与后端 labels.instance 匹配
+
+kv_cache:                            # KV 前缀感知路由
+  enabled: true
+  max_prefix_bytes: 4096
+  ttl: 10m
+  prune_interval: 30s
+  match_threshold: 0.3               # cache_aware 走亲和所需最小前缀命中率
+  balance_abs_threshold: 32          # 双阈值失衡判定，超限回退最小负载
+  balance_rel_threshold: 1.5
+
+policies:                            # 调度策略表达式（strategy=expression 时引用）
+  default:                           # 不写则自动注入内置 default（等价 preset: balanced）
+    preset: balanced                 # 内置方案预设，与手写 filter/score 二选一
+                                     # 可选：balanced | cache_affinity | latency_first |
+                                     #       preemption_safe | throughput_first
+                                     # 说明见 internal/policy/README.md；运行期可经
+                                     # POST /admin/presets/{name}/apply 一键切换
+  gpu_aware:                         # 结合外部 Prometheus 注入变量的示例
+    filter: 'healthy && kv_usage < 0.95'
+    score: 'waiting * 5.0 + vars["gpu_util"] * 0.1'
+  safe_latency:                      # 抢占规避 + TTFT 反馈闭环（两个变量由网关预计算）
+    filter: 'healthy && kv_usage < 0.88'
+    score: 'preempt_rate * 80.0 + ttft_ewma * 30.0 + waiting * 6.0 - prefix_match * 10.0'
+
+backends:
+  - id: vllm-a
+    url: http://10.0.0.1:8000
+    engine: vllm                     # vllm | vllm_omni | sglang | sglang_omni
+    weight: 2
+    max_concurrency: 256             # 网关侧并发上限，0 不限
+    labels: { instance: "10.0.0.1:8000", zone: "a" }
+  - id: sglang-a
+    url: http://10.0.0.3:30000
+    engine: sglang
+  - id: omni-a
+    url: http://10.0.0.5:8000
+    engine: vllm_omni
+  - id: prefill-1                    # PD 分离：prefill 实例
+    url: http://10.0.1.1:30000
+    engine: sglang
+    bootstrap_port: 8998
+  - id: decode-1                     # PD 分离：decode 实例
+    url: http://10.0.1.11:30000
+    engine: sglang
+
+models:                              # 模型名 -> 后端池/分池/PD 组 路由
+  - name: qwen3-32b
+    backends: [vllm-a, sglang-a]
+    strategy: expression             # round_robin | random | weighted_random | least_request |
+                                     # p2c | consistent_hash | cache_aware | expression
+    policy: default
+    rate_limit_qps: 200              # 模型级令牌桶限流，<=0 不限
+    rate_limit_burst: 400
+  - name: gpt-4                      # 对外统一模型名 -> 后端实际部署名
+    backends: [vllm-a]
+    rewrite_model: qwen3-32b         # 转发前改写请求体 model 字段
+  - name: qwen3-canary               # 金丝雀分流：backends/splits/pd_group 三选一
+    splits:
+      - name: stable
+        backends: [vllm-a]
+        weight: 90                   # 按权重占比分流
+      - name: canary
+        backends: [sglang-a]
+        weight: 10
+        strategy: least_request      # 子池可独立选路策略，缺省继承路由
+    strategy: expression             # 选中子池无可用后端时回退全池（各子池并集）
+  - name: qwen3-omni
+    backends: [omni-a]
+    strategy: least_request
+  - name: qwen3-32b-pd               # PD 分离部署走 pd_group
+    pd_group: pd-main
+    strategy: expression
+  - name: "*"                        # 兜底路由
+    backends: [vllm-a, sglang-a]
+    strategy: cache_aware
+
+pd_groups:
+  - name: pd-main
+    prefill: [prefill-1]
+    decode: [decode-1]
+    nccl_links:                      # 显式声明已建链的 KV 传输链路；为空表示全互联
+      - { prefill: prefill-1, decode: decode-1, bandwidth_gbps: 200 }
+    strategy: expression             # prefill 侧选择策略
+    policy: default
+
+session:                             # 会话粘性：同一会话固定路由到同一后端
+  enabled: true                      # 会话键取 X-Session-Id 头，缺省回退请求体 user 字段
+  ttl: 10m                           # 绑定滑动过期时间
+  max_entries: 100000                # 绑定表容量上限，超限按最久未用淘汰
+
+queue:                               # 容量排队：无可用容量时短暂排队而非立即失败
+  enabled: true
+  max_wait: 5s                       # 排队超时（超时 503；队列满 429）
+  max_depth: 1024
+  # 容量准入（可选）：将要排队时求值，false 立即 429 快速失败；
+  # 变量 = 请求特征（prompt_tokens_est/is_multimodal/image_count/...）
+  #      + 模型路由集群聚合（avg_kv_usage/total_waiting/available_count/...）
+  admission_expr: 'prompt_tokens_est < 32000 && (avg_kv_usage < 0.9 || prompt_tokens_est < 2000)'
+
+alerting:                            # 指标告警：规则表达式周期求值 + webhook 推送
+  enabled: true
+  interval: 5s
+  webhooks:
+    - name: ops-dingtalk             # 运维群机器人
+      url: https://oapi.dingtalk.com/robot/send?access_token=xxx
+      template: dingtalk             # generic | dingtalk | feishu | wecom | slack
+      timeout: 5s
+      retries: 3
+      retry_backoff: 1s
+    - name: autoscaler               # 自动扩容控制器（程序化消费，用 generic 原始 JSON）
+      url: http://scaler.internal:8443/events
+      template: generic
+      headers: { X-Token: "changeme" }
+  rules:
+    # backend 作用域：逐后端求值，变量同调度表达式（running/waiting/kv_usage/raw/vars...）
+    - name: backend_kv_pressure
+      scope: backend
+      expr: 'kv_usage > 0.92'
+      for: 30s                       # 持续满足 30s 才 firing
+      severity: warning
+      repeat_interval: 10m           # firing 期间每 10 分钟重复通知；0 只通知一次
+      webhooks: [ops-dingtalk]
+      summary: "后端 KV cache 占用过高，可能开始抢占/驱逐"
+    - name: backend_down
+      scope: backend
+      expr: '!healthy'
+      for: 10s
+      severity: critical
+      webhooks: [ops-dingtalk]
+      summary: "后端健康检查失败"
+    # cluster 作用域：逐模型路由聚合求值（avg_waiting/max_kv_usage/available_count...）
+    - name: cluster_saturated
+      scope: cluster
+      expr: 'avg_waiting > 10 && avg_kv_usage > 0.85'
+      for: 1m
+      severity: critical
+      webhooks: [ops-dingtalk, autoscaler]
+      summary: "集群容量饱和，请求开始堆积"
+      labels: { runbook: "docs/runbook/saturation.md" }
+
+autoscale:                           # 自动扩缩容建议：网关发信号，外部控制器落地
+  enabled: true
+  interval: 15s
+  webhooks: [autoscaler]             # 建议事件投递目标（引用 alerting.webhooks）
+  policies:
+    - model: qwen3-32b               # 须为 models 中的路由名
+      min_replicas: 2
+      max_replicas: 8                # 0 表示不设上限
+      scale_up_expr: 'avg_waiting > 8 || max_kv_usage > 0.9'    # cluster 作用域变量
+      scale_down_expr: 'avg_waiting < 1 && avg_kv_usage < 0.4'
+      scale_up_step: 2
+      scale_down_step: 1
+      scale_up_cooldown: 1m          # 扩快缩慢，防止指标抖动导致震荡
+      scale_down_cooldown: 5m
+
+tracing:                             # 分布式追踪（OpenTelemetry）
+  enabled: true
+  endpoint: "otel-collector:4318"    # OTLP/HTTP 接收端（Collector/Jaeger/Tempo）
+  insecure: true                     # 集群内明文 HTTP
+  sample_ratio: 1.0                  # 0~1；父 trace 已采样则跟随父决策
+  service_name: ai-gateway
+  # headers: { Authorization: "Bearer xxx" }
+
+cluster:                             # 多实例水平部署：以 Redis 为协调层
+  enabled: true
+  redis_addr: "redis:6379"           # 单机形态；与 redis_addrs 二选一
+  # redis_addrs: ["sen1:26379", "sen2:26379", "sen3:26379"]  # Sentinel/Cluster 地址列表
+  # redis_master_name: mymaster      # 非空即 Sentinel 模式（HA 推荐）；
+  #                                  # 多地址且无 master_name 则为 Redis Cluster 模式
+  redis_password: ""                 # 按需
+  redis_db: 0
+  key_prefix: gateway                # 同一 Redis 承载多套集群时用于隔离
+  instance_id: ""                    # 缺省 主机名+监听地址，集群内须唯一
+  heartbeat_interval: 3s             # 实例注册心跳周期
+  heartbeat_ttl: 10s                 # 心跳存活 TTL，超时从成员视图消失
+  leader_ttl: 15s                    # leader 租约时长，到期未续自动重选
+  rate_limit_mode: distributed       # distributed=全集群共享配额 | local=各实例独立
+  session_mode: shared               # shared=绑定表存 Redis | local=需前置 LB 会话哈希
+  op_timeout: 500ms                  # 单次 Redis 操作超时，超时按故障降级
+
+store:                               # 动态配置持久层：admin 变更落库，重启恢复
+  enabled: true
+  driver: postgres                   # postgres | mysql
+  dsn: "postgres://gw:secret@postgres:5432/gateway?sslmode=disable"
+  # mysql 示例: "gw:secret@tcp(mysql:3306)/gateway?parseTime=true"
+  max_open_conns: 4                  # 仅承载低频管理操作
+  op_timeout: 3s
+  reconcile_interval: 30s            # 对账周期：以 DB 为事实来源收敛错过的集群广播

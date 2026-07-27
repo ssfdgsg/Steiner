@@ -1,0 +1,15 @@
+# 四引擎 mock 后端镜像（仅本地演示与集成测试用，不用于生产）。
+# 同样是 scratch 基底：mock 不外呼 HTTPS，连根证书都不需要，镜像更小。
+FROM golang:1.22-alpine AS builder
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY} GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -trimpath -ldflags "-s -w" -o /out/mockbackend ./test/mockbackend/cmd
+
+FROM scratch
+COPY --from=builder /out/mockbackend /mockbackend
+USER 10001:10001
+ENTRYPOINT ["/mockbackend"]

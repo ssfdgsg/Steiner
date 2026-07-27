@@ -1,0 +1,14 @@
+# Prometheus 抓取配置：只需抓网关，即可获得网关自身指标 +
+# 网关透出的全后端归一化负载视图（backend collector）。
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: ai-gateway
+    static_configs:
+      - targets: ["gateway:8080"]
+
+  # 可选：直采各推理后端原生指标（生产环境按需展开）
+  - job_name: inference-backends
+    static_configs:
+      - targets: ["mock-vllm:8001", "mock-sglang:30000"]

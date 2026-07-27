@@ -1,0 +1,79 @@
+{
+  "title": "AI Gateway — LLM 推理网关",
+  "uid": "ai-gateway",
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "请求 QPS（按后端）",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [{ "expr": "sum by (backend) (rate(gateway_requests_total[1m]))", "legendFormat": "{{backend}}" }]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "错误率（非 2xx 占比）",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "sum(rate(gateway_requests_total{code!~\"2..\"}[5m])) / sum(rate(gateway_requests_total[5m]))",
+        "legendFormat": "错误率"
+      }]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "TTFT P50 / P95 / P99",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_time_to_first_byte_seconds_bucket[5m])))", "legendFormat": "P50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_time_to_first_byte_seconds_bucket[5m])))", "legendFormat": "P95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_time_to_first_byte_seconds_bucket[5m])))", "legendFormat": "P99" }
+      ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "后端在途请求与健康状态",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "gateway_backend_inflight", "legendFormat": "inflight {{backend}}" },
+        { "expr": "gateway_backend_healthy * 10", "legendFormat": "healthy×10 {{backend}}" }
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "重试 / 限流 / 选路失败",
+      "gridPos": { "x": 0, "y": 16, "w": 8, "h": 8 },
+      "targets": [
+        { "expr": "rate(gateway_retries_total[5m])", "legendFormat": "重试" },
+        { "expr": "sum(rate(gateway_rate_limited_total[5m]))", "legendFormat": "限流拒绝" },
+        { "expr": "sum by (reason) (rate(gateway_pick_errors_total[5m]))", "legendFormat": "选路失败 {{reason}}" }
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "KV 前缀树规模与排队深度",
+      "gridPos": { "x": 8, "y": 16, "w": 8, "h": 8 },
+      "targets": [
+        { "expr": "gateway_kvtree_bytes", "legendFormat": "树字节数" },
+        { "expr": "gateway_kvtree_nodes", "legendFormat": "树节点数" },
+        { "expr": "gateway_queue_depth", "legendFormat": "排队深度" }
+      ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "PD 链路在途 KV 传输",
+      "gridPos": { "x": 16, "y": 16, "w": 8, "h": 8 },
+      "targets": [{ "expr": "gateway_pd_link_inflight", "legendFormat": "{{prefill}}→{{decode}}" }]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "生成吞吐（token/s，按后端归一化视图）",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum by (backend, model) (rate(gateway_completion_tokens_total[1m]))", "legendFormat": "{{backend}}/{{model}}" }
+      ]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "告警 firing 与扩缩容建议副本数",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "gateway_alerts_firing", "legendFormat": "firing {{rule}}" },
+        { "expr": "gateway_autoscale_desired_replicas", "legendFormat": "期望副本 {{model}}" }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

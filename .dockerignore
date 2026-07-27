@@ -1,0 +1,22 @@
+# 构建上下文裁剪：不需要进镜像的一律排除，减少传输量与构建时间。
+#
+# 注意两处必须保留：
+#   internal/webui/dist  控制台产物（go:embed 打进二进制）
+#   test/mockbackend     mock 后端源码（Dockerfile.mock 需要编译它）
+
+.git
+.github
+.claude
+web/node_modules
+web/.vite
+*.md
+docs
+deploy/grafana
+deploy/k8s
+scripts
+test/integration
+test/conformance
+**/*_test.go
+**/testdata
+.gitignore
+Makefile

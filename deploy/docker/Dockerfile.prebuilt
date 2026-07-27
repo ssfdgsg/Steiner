@@ -1,0 +1,22 @@
+# 极简打包：宿主机先编译好二进制，再搬进 scratch 镜像。
+# 与自包含版（Dockerfile）相比：构建镜像层不进产物、无需在容器内下载依赖，
+# 构建速度最快（秒级），适合 CI 已有编译产物、或宿主机 Go 环境更快的场景。
+#
+# 用法（务必先编译，见 scripts/build-image.sh 或 make image-prebuilt）：
+#   CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o dist/gateway ./cmd/gateway
+#   docker build -f deploy/docker/Dockerfile.prebuilt -t ai-gateway:slim .
+#
+# 前提：二进制必须是静态链接（CGO_ENABLED=0）——scratch 里没有任何动态库。
+
+FROM scratch
+
+# 根证书：外呼 HTTPS（webhook / OTLP / PromQL）必需。
+# 由 scripts/build-image.sh 从宿主机复制到 dist/ca-certificates.crt。
+COPY dist/ca-certificates.crt /etc/ssl/certs/
+COPY dist/gateway /gateway
+COPY configs/gateway.yaml /etc/ai-gateway/gateway.yaml
+
+USER 10001:10001
+EXPOSE 8080
+ENTRYPOINT ["/gateway"]
+CMD ["-config", "/etc/ai-gateway/gateway.yaml"]

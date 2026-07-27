@@ -1,0 +1,150 @@
+# ai-gateway 可直接运行的参考配置（与 internal/config 结构一一对应）。
+# 完整字段说明见 configs/README.md 与各模块 README。
+
+server:
+  listen: ":8080"
+  max_body_bytes: 33554432          # 32MiB，omni 多模态请求体较大时按需调高
+  retries: 2                        # 未写出首字节前的换后端重试次数
+  upstream_connect_timeout: 3s
+  upstream_response_timeout: 120s   # 等待响应头超时；流式响应体不受限
+  failure_threshold: 3              # 连续失败 N 次被动摘除
+  eject_cooldown: 15s               # 被动摘除冷却期
+
+metrics:
+  scrape_interval: 2s               # 直采后端 /metrics 周期
+  scrape_timeout: 2s
+  health_interval: 5s               # 主动健康检查周期
+  health_timeout: 2s
+
+# 外部 Prometheus 旁路查询（url 为空则关闭）。
+# 查询结果按标签匹配注入各后端表达式变量 vars["<name>"]。
+prometheus:
+  url: ""                           # 例：http://prometheus:9090
+  interval: 10s
+  timeout: 5s
+  queries:
+    - name: gpu_util
+      query: 'avg by (instance) (DCGM_FI_DEV_GPU_UTIL)'
+      backend_label: instance       # 与后端 labels.instance 或 URL host 匹配
+
+# 会话粘性：同一会话（X-Session-Id 头或请求体 user 字段）固定路由到同一后端，
+# 绑定后端下线时自动改绑；与 kv_cache 前缀亲和叠加提升多轮对话命中率。
+session:
+  enabled: true
+  ttl: 10m
+  max_entries: 100000
+
+# 容量排队：集群瞬时无可用容量时短暂排队等待，而非立即 503。
+queue:
+  enabled: true
+  max_wait: 5s
+  max_depth: 1024
+
+kv_cache:
+  enabled: true
+  max_prefix_bytes: 4096            # 每条请求纳入前缀树的最大字节数
+  ttl: 10m                          # 前缀归属过期时间
+  prune_interval: 30s
+  match_threshold: 0.3              # cache_aware 走亲和的最小命中率
+  balance_abs_threshold: 32         # 失衡判定（对齐 sglang-router 语义）
+  balance_rel_threshold: 1.5
+
+# 调度策略表达式：filter 过滤候选（bool），score 打分（数值，最小者胜出）。
+# 可用变量见 internal/policy/README.md；运行期可经 PUT /admin/policies/{name} 热更。
+policies:
+  # 方式一：引用内置方案预设（推荐起步）。可选：
+  #   balanced         均衡基线
+  #   cache_affinity   缓存亲和优先（多轮对话/固定 system prompt 的 RAG）
+  #   latency_first    低时延优先（TTFT 反馈闭环 + KV 水位收紧）
+  #   preemption_safe  显存保守（抢占规避，长上下文高压场景）
+  #   throughput_first 吞吐优先（离线批量）
+  # 运行期可经 POST /admin/presets/{name}/apply 一键切换，前端下拉即可。
+  default:
+    preset: balanced
+
+  # 方式二：手写表达式（与 preset 二选一）。示例：结合外部 GPU 利用率与前缀命中
+  gpu_aware:
+    filter: "healthy && kv_usage < 0.95"
+    score: >-
+      running * 2.0 + waiting * 5.0 + kv_usage * 10.0
+      - prefix_match * 8.0 + vars["gpu_util"] * 0.05
+
+  # 示例：抢占规避 + 时延反馈的组合（新变量 preempt_rate / ttft_ewma 由网关预计算）
+  safe_latency:
+    filter: "healthy && kv_usage < 0.88"
+    score: >-
+      preempt_rate * 80.0 + ttft_ewma * 30.0 + waiting * 6.0
+      + kv_usage * kv_usage * 20.0 - prefix_match * 10.0
+
+backends:
+  - id: vllm-a
+    engine: vllm                    # vllm | vllm_omni | sglang | sglang_omni
+    url: http://127.0.0.1:8001
+    weight: 1
+    max_concurrency: 256            # 网关侧并发上限，0 不限
+    labels: { instance: "10.0.0.1:8000" }
+  - id: vllm-b
+    engine: vllm
+    url: http://127.0.0.1:8002
+  - id: sglang-a
+    engine: sglang
+    url: http://127.0.0.1:30001
+  - id: omni-a
+    engine: vllm_omni
+    url: http://127.0.0.1:8003
+
+  # PD 分离角色实例（由 pd_groups 引用）
+  - id: prefill-1
+    engine: sglang
+    url: http://127.0.0.1:30011
+    bootstrap_port: 8998            # sglang PD prefill bootstrap 端口
+  - id: prefill-2
+    engine: sglang
+    url: http://127.0.0.1:30012
+    bootstrap_port: 8998
+  - id: decode-1
+    engine: sglang
+    url: http://127.0.0.1:30021
+  - id: decode-2
+    engine: sglang
+    url: http://127.0.0.1:30022
+
+# PD 分离组：nccl_links 声明已建立的 KV 传输链路（NCCL/NIXL）；
+# 缺省全互联。调度只在已建链的 (prefill, decode) 组合内配对。
+pd_groups:
+  - name: qwen-pd
+    prefill: [prefill-1, prefill-2]
+    decode: [decode-1, decode-2]
+    strategy: expression
+    policy: default
+    nccl_links:
+      - { prefill: prefill-1, decode: decode-1, bandwidth_gbps: 400 }
+      - { prefill: prefill-1, decode: decode-2, bandwidth_gbps: 200 }
+      - { prefill: prefill-2, decode: decode-2, bandwidth_gbps: 400 }
+
+# 模型路由：name 为模型名，"*" 兜底；backends 与 pd_group 二选一。
+# strategy: round_robin | random | weighted_random | least_request |
+#           p2c | consistent_hash | cache_aware | expression
+models:
+  - name: qwen3-32b
+    backends: [vllm-a, vllm-b, sglang-a]
+    strategy: expression
+    policy: default
+    rate_limit_qps: 200
+    rate_limit_burst: 400
+  - name: qwen3-omni
+    backends: [omni-a]
+    strategy: least_request
+  - name: qwen3-32b-pd                # PD 分离部署形态
+    pd_group: qwen-pd
+    strategy: expression
+    policy: default
+  - name: "*"                         # 兜底：未声明的模型
+    backends: [vllm-a, vllm-b, sglang-a]
+    strategy: cache_aware
+
+cluster:                              # 多实例水平部署（协调层 Redis，见 gateway.example.yaml）
+  enabled: false
+
+store:                                # 动态配置持久层（PG/MySQL，见 gateway.example.yaml）
+  enabled: false

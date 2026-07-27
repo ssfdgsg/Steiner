@@ -1,0 +1,51 @@
+# Build outputs and Go tooling
+/bin/
+/coverage/
+/dist/gateway
+/dist/mockbackend
+*.test
+*.cover
+*.prof
+coverage.out
+
+# Frontend dependencies and local build cache
+/web/node_modules/
+/web/dist/
+/web/.vite/
+/web/*.tsbuildinfo
+
+# Local runtime data and downloaded conformance models
+/deploy/conformance/model-cache/
+/tmp/
+/data/
+/volumes/
+
+# Local configuration overrides (keep the documented examples in version control)
+.env
+.env.*
+!.env.example
+/configs/*.local.yaml
+/configs/*.local.yml
+/configs/gateway.override.yaml
+/configs/gateway.override.yml
+
+# Credentials and private certificates
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Logs, editor files, and AI-tool workspace state
+*.log
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+.codex/
+.agents/

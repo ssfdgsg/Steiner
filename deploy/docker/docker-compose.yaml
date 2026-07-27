@@ -1,0 +1,59 @@
+# 开箱即用的本地演示编排：网关 + 两个 mock 后端 + Prometheus。
+#
+# 启动：make up      （或 docker compose -f deploy/docker/docker-compose.yaml up --build -d）
+# 停止：make down
+#
+# 访问：
+#   控制台      http://localhost:8080/admin/ui/
+#   模型清单    curl http://localhost:8080/v1/models
+#   Prometheus  http://localhost:9090
+#
+# 端口冲突时：GATEWAY_PORT=18080 PROM_PORT=19090 make up
+#
+# 全部镜像均为 scratch 基底（网关 ~24MB，mock ~8MB）。
+# 境内加速：docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+    image: ai-gateway:compose
+    command: ["-config", "/etc/ai-gateway/gateway.yaml"]
+    volumes:
+      - ./gateway-compose.yaml:/etc/ai-gateway/gateway.yaml:ro
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      - mock-vllm
+      - mock-sglang
+    restart: unless-stopped
+
+  mock-vllm:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.mock
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+    image: ai-gateway-mock:compose
+    command: ["-type", "vllm", "-port", "8001"]
+    restart: unless-stopped
+
+  mock-sglang:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.mock
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+    image: ai-gateway-mock:compose
+    command: ["-type", "sglang", "-port", "30000"]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${PROM_PORT:-9090}:9090"
+    restart: unless-stopped

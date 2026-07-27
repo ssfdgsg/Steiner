@@ -1,0 +1,15 @@
+# Keep text files portable across development environments.
+* text=auto eol=lf
+
+# Preserve native line endings for binary and image assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+
+# These files are built from web/ but intentionally committed for go:embed builds.
+/internal/webui/dist/** linguist-generated=true

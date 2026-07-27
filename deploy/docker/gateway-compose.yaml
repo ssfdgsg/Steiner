@@ -1,0 +1,27 @@
+# docker-compose 演示环境的网关配置（后端指向编排内的 mock 服务）。
+server:
+  listen: ":8080"
+
+metrics:
+  scrape_interval: 1s
+
+session:
+  enabled: true
+
+queue:
+  enabled: true
+
+kv_cache:
+  enabled: true
+
+backends:
+  - { id: vllm-a,   engine: vllm,   url: "http://mock-vllm:8001" }
+  - { id: sglang-a, engine: sglang, url: "http://mock-sglang:30000" }
+
+models:
+  - name: demo-model
+    backends: [vllm-a, sglang-a]
+    strategy: expression
+  - name: "*"
+    backends: [vllm-a, sglang-a]
+    strategy: cache_aware

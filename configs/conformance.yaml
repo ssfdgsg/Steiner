@@ -1,0 +1,26 @@
+# conformance 验证专用配置：单后端指向 deploy/conformance 里的真实 vLLM。
+# 模型名改写路径被刻意纳入验证：对外名 gw-conf-model 改写为部署名
+# conformance-model——若改写失效，真实引擎会直接 404，测试即失败。
+server:
+  listen: ":18190"
+  retries: 1
+
+metrics:
+  scrape_interval: 1s
+  scrape_timeout: 3s
+  health_interval: 2s
+  health_timeout: 3s
+
+kv_cache:
+  enabled: true
+
+backends:
+  - id: vllm-real
+    url: http://127.0.0.1:18100
+    engine: vllm
+
+models:
+  - name: gw-conf-model
+    backends: [vllm-real]
+    strategy: least_request
+    rewrite_model: conformance-model

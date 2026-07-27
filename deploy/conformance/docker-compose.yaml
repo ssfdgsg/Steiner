@@ -1,0 +1,32 @@
+# 真实引擎 conformance 环境：官方 vLLM CPU 镜像 + 小模型，用于验证网关
+# 对真实引擎的协议边界（指标名适配、SSE 分帧、usage 提取、健康检查）。
+# 由 scripts/conformance.sh 编排，不建议手工长期运行（CPU 推理仅供验证）。
+services:
+  vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai-cpu:latest-x86_64}
+    command:
+      - --model
+      # 缺省用宿主预下载的本地模型（scripts/conformance.sh 负责下载），
+      # 引擎无需出网；设 CONFORMANCE_MODEL 为 HF id 可改为在线下载。
+      - ${CONFORMANCE_MODEL:-/models/smollm2}
+      # 网关 rewrite_model 的目标名：对外名 gw-conf-model -> 此部署名
+      - --served-model-name
+      - conformance-model
+      - --max-model-len
+      - "2048"
+      - --enforce-eager
+    # 模型下载遇瞬时网络故障时进程会直接退出，自动重启自愈（上限 5 次）。
+    restart: on-failure:5
+    environment:
+      # 国内网络默认走镜像站；导出 HF_ENDPOINT= 可切回官方源
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      VLLM_CPU_KVCACHE_SPACE: "2"
+    ports:
+      - "18100:8000"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - ./model-cache:/models:ro
+
+volumes:
+  # 模型缓存卷：跨运行复用，首次下载后再跑无需网络
+  hf-cache:
