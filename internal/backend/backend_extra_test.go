@@ -2,6 +2,7 @@
 package backend
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -117,19 +118,19 @@ func TestHealthCheckerCheckOne(t *testing.T) {
 	defer srv.Close()
 
 	hc := NewHealthChecker(func() []*Backend { return nil }, time.Second, time.Second, nil)
-	ok := hc.checkOne(t.Context(), mkBackend(t, srv.URL+"/health"))
+	ok := hc.checkOne(context.Background(), mkBackend(t, srv.URL+"/health"))
 	if !ok {
 		t.Fatal("2xx 健康路径应返回 true")
 	}
 	// 5xx
 	b2 := mkBackend(t, srv.URL+"/down")
 	b2.HealthPath = "/down"
-	if hc.checkOne(t.Context(), b2) {
+	if hc.checkOne(context.Background(), b2) {
 		t.Fatal("5xx 应返回 false")
 	}
 	// 连接失败
 	b3 := mkBackend(t, "http://127.0.0.1:1/health")
-	if hc.checkOne(t.Context(), b3) {
+	if hc.checkOne(context.Background(), b3) {
 		t.Fatal("连接失败应返回 false")
 	}
 }
@@ -157,7 +158,7 @@ func TestHealthCheckerFlipCallback(t *testing.T) {
 
 	// checkAll 在 goroutine 内探测；用"探测请求命中数"做完成屏障，
 	// 保证上一轮 goroutine 已结束再进入下一轮（避免并发翻转竞态）。
-	run := func() { hc.checkAll(t.Context()) }
+	run := func() { hc.checkAll(context.Background()) }
 	waitHits := func(want int64) {
 		t.Helper()
 		deadline := time.Now().Add(2 * time.Second)
