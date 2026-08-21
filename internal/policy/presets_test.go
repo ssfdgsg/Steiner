@@ -55,13 +55,25 @@ func TestFindPreset(t *testing.T) {
 }
 
 func TestMatchPreset(t *testing.T) {
+	// 显式声明 preset（config.PolicyConfig.Preset 非空）→ 返回该预设名。
 	for _, pr := range Presets {
-		if got := MatchPreset(pr.Filter, pr.Score); got != pr.Name {
-			t.Fatalf("预设 %s 反查失败，得到 %q", pr.Name, got)
+		if got := MatchPreset(pr.Filter, pr.Score, pr.Name); got != pr.Name {
+			t.Fatalf("显式声明 %s 应返回其名，得到 %q", pr.Name, got)
 		}
 	}
+	// 未显式声明（手写表达式，即使与预设字符串逐字相同）→ custom。
+	for _, pr := range Presets {
+		if got := MatchPreset(pr.Filter, pr.Score); got != "custom" {
+			t.Fatalf("手写但等于预设 %s 的表达式应视为 custom，得到 %q", pr.Name, got)
+		}
+	}
+	// 手写自定义表达式 → custom。
 	if got := MatchPreset("healthy", "running * 1.23"); got != "custom" {
-		t.Fatalf("手写表达式应反查为 custom，得到 %q", got)
+		t.Fatalf("手写表达式应视为 custom，得到 %q", got)
+	}
+	// 声明不存在的预设 → custom。
+	if got := MatchPreset("healthy", "running * 1.23", "不存在的方案"); got != "custom" {
+		t.Fatalf("未知预设名应视为 custom，得到 %q", got)
 	}
 }
 

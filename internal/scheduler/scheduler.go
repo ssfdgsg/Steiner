@@ -15,10 +15,12 @@ package scheduler
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,11 +56,71 @@ type Scheduler struct {
 	// rings 一致性哈希环缓存，键为候选集合签名。
 	ringMu sync.Mutex
 	rings  map[string]*ring
+
+	// ringsStable 修复后的哈希环缓存：键为稳定内容签名（候选 ID 排序哈希），
+	// 值携带构建时的池快照用于"同 ID 换实例"检测。取代 ring.go 中基于
+	// &pool[0] 地址的旧 pickHash/ringSignature（地址可被 GC 复用 → 陈旧环）。
+	ringsStable map[string]*ringCacheEntry
 }
 
 // New 构造调度器。tree 可为 nil。
 func New(pol *policy.Engine, tree *kvcache.Tree, kvCfg config.KVCacheConfig) *Scheduler {
-	return &Scheduler{pol: pol, tree: tree, kvCfg: kvCfg, rings: map[string]*ring{}}
+	return &Scheduler{
+		pol:         pol,
+		tree:        tree,
+		kvCfg:       kvCfg,
+		rings:       map[string]*ring{},
+		ringsStable: map[string]*ringCacheEntry{},
+	}
+}
+
+// PromptRequirements 告诉代理层当前路由是否需要解析 prompt 特征，以及需要保留
+// 多少字节的 PromptText。0 表示不保留，负数表示完整保留。
+//
+// 大多数负载/轮询策略只需要 model/stream 等小字段，可以走轻量信封解析；
+// KV 前缀树最多使用 MaxPrefixBytes；无 session 的 consistent_hash 必须保留完整
+// prompt 以维持既有哈希语义。
+func (s *Scheduler) PromptRequirements(route *backend.Route, hasSession bool) (needFeatures bool, textLimit int) {
+	if s.tree != nil {
+		needFeatures = true
+		textLimit = s.kvCfg.MaxPrefixBytes
+	}
+	check := func(strategy, policyName string) {
+		switch strategy {
+		case "consistent_hash":
+			if !hasSession {
+				needFeatures = true
+				textLimit = -1
+			}
+		case "expression":
+			if policyName == "" {
+				policyName = config.DefaultPolicyName
+			}
+			if p := s.pol.Get(policyName); p != nil && policyUsesPromptFeatures(p) {
+				needFeatures = true
+			}
+		}
+	}
+	check(route.Strategy, route.PolicyName)
+	for _, sp := range route.Splits {
+		check(sp.Strategy, sp.PolicyName)
+	}
+	return needFeatures, textLimit
+}
+
+var promptFeatureVariables = []string{
+	"prompt_len", "prompt_tokens", "is_multimodal",
+	"image_count", "audio_count", "video_count",
+}
+
+func policyUsesPromptFeatures(p *policy.Policy) bool {
+	src := p.FilterSrc + "\n" + p.ScoreSrc
+	for _, name := range promptFeatureVariables {
+		if strings.Contains(src, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // Pick 按路由配置选一个后端。exclude 为本次请求已失败过的后端集合。
@@ -119,7 +181,7 @@ func (s *Scheduler) PickAmong(pool []*backend.Backend, strategy, policyName stri
 		}
 		return a, nil
 	case "consistent_hash":
-		return s.pickHash(pool, candidates, req), nil
+		return s.pickHashStable(pool, candidates, req)
 	case "cache_aware":
 		return s.pickCacheAware(candidates, req), nil
 	case "expression":
@@ -159,6 +221,12 @@ func pickWeighted(candidates []*backend.Backend) *backend.Backend {
 	for _, b := range candidates {
 		total += b.Weight
 	}
+	if total <= 0 {
+		// M15：权重和≤0（全零或负权重，normalizeWeight 之外的旁路构造路径）
+		// 时 rand.Float64()*total 恒为 0，旧代码要么落在首候选要么绕完整圈
+		// 返回末位，权重语义完全失效。显式回退到首候选，行为确定。
+		return candidates[0]
+	}
 	r := rand.Float64() * total
 	for _, b := range candidates {
 		r -= b.Weight
@@ -167,6 +235,94 @@ func pickWeighted(candidates []*backend.Backend) *backend.Backend {
 		}
 	}
 	return candidates[len(candidates)-1]
+}
+
+// ringCacheEntry 一致性哈希环缓存项：环本身 + 构建时的池快照。
+// 快照用于"同 ID 换实例"检测：内容签名对相同 ID 集合稳定（这是签名设计的
+// 目标——路由池增删顺序变化不重建环），但注册表 UpsertBackend 以同 ID 替换
+// 实例后池内元素指针变化，若直接复用旧环会返回已摘除的旧实例指针。
+type ringCacheEntry struct {
+	rg   *ring
+	pool []*backend.Backend
+}
+
+// ringSignatureContent 稳定内容签名：候选 ID 排序后拼接做 fnv64a 哈希。
+// 取代 ring.go 旧 ringSignature 的 &pool[0] 地址签名——Go 不保证新池分配
+// 不复用已回收数组的地址与长度，地址复用会命中陈旧环（一致性哈希对所有键
+// 坍缩为固定首候选）。内容签名与底层数组地址、切片顺序无关；空池返回明确
+// 错误而非 panic（正常调用链 PickAmong 有前置空检查，此处防御）。
+func ringSignatureContent(pool []*backend.Backend) (string, error) {
+	if len(pool) == 0 {
+		return "", fmt.Errorf("一致性哈希签名失败:候选池为空")
+	}
+	ids := make([]string, len(pool))
+	for i, b := range pool {
+		ids[i] = b.ID
+	}
+	sort.Strings(ids)
+	h := fnv.New64a()
+	for _, id := range ids {
+		_, _ = h.Write([]byte(id))
+		_, _ = h.Write([]byte{0}) // 分隔符，避免 "ab"+"c" 与 "a"+"bc" 撞签名
+	}
+	return fmt.Sprintf("%d", h.Sum64()), nil
+}
+
+// sameInstances 逐元素指针身份比较：两个池快照是否指向完全相同的后端实例
+// 集合（与顺序无关——环的落点由 ID 哈希决定，与池顺序无关）。
+func sameInstances(a, b []*backend.Backend) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// pickHashStable 一致性哈希选路（修复版）。环按"完整池"构建（保证键落点
+// 稳定），可用性过滤在环上顺时针查找时进行；环缓存键为稳定内容签名。
+// 与 ring.go 旧 pickHash 的区别：
+//  1. 签名基于候选 ID 排序哈希而非 &pool[0] 地址——地址复用不再命中陈旧环；
+//  2. 缓存项携带池快照，同 ID 换实例（upsert）时逐元素指针校验失败 → 重建，
+//     杜绝返回已摘除的旧实例指针；
+//  3. 空池返回显式错误而非对 &pool[0] 取地址 panic。
+func (s *Scheduler) pickHashStable(pool, candidates []*backend.Backend, req *Request) (*backend.Backend, error) {
+	key := req.SessionID
+	if key == "" {
+		key = req.PromptText
+	}
+	if key == "" {
+		key = req.Model
+	}
+
+	sig, err := ringSignatureContent(pool)
+	if err != nil {
+		return nil, fmt.Errorf("一致性哈希选路: %w", err)
+	}
+	s.ringMu.Lock()
+	entry, okCache := s.ringsStable[sig]
+	if !okCache || !sameInstances(entry.pool, pool) {
+		// 上限兜底：整体清空避免动态增删后端时缓存无界增长（环构建为微秒级）。
+		if len(s.ringsStable) >= maxRingCache {
+			s.ringsStable = map[string]*ringCacheEntry{}
+		}
+		entry = &ringCacheEntry{rg: buildRing(pool), pool: pool}
+		s.ringsStable[sig] = entry
+	}
+	rg := entry.rg
+	s.ringMu.Unlock()
+
+	allowed := make(map[string]bool, len(candidates))
+	for _, b := range candidates {
+		allowed[b.ID] = true
+	}
+	if b := rg.get(key, func(b *backend.Backend) bool { return allowed[b.ID] }); b != nil {
+		return b, nil
+	}
+	return candidates[0], nil
 }
 
 // prefixMatches 计算每个后端的前缀命中率（0~1）。
@@ -213,7 +369,12 @@ func (s *Scheduler) pickCacheAware(candidates []*backend.Backend, req *Request) 
 }
 
 // pickExpression 逐后端求值策略表达式，取分数（代价）最小者。
-// 全部被过滤时降级为最小负载，保证请求不因策略过严而整体失败。
+// 降级语义区分两类"无候选"：
+//   - 求值错误数 >0 且无候选（H7）：filter 引用未知变量/除零/超时等运行期
+//     错误导致候选被跳过，此时静默 pickLeast 会绕过 filter 约束，把请求发往
+//     本应被过滤的后端 —— fail-closed，返回显式错误（请求方按 503 处理）；
+//   - 全部候选被合法 filter 拒绝（pass=false 且零错误）：设计中的降级路径，
+//     维持 pickLeast 兜底，保证请求不因策略过严而整体失败。
 func (s *Scheduler) pickExpression(candidates []*backend.Backend, policyName string, req *Request) (*backend.Backend, error) {
 	p := s.pol.Get(policyName)
 	if p == nil {
@@ -222,10 +383,16 @@ func (s *Scheduler) pickExpression(candidates []*backend.Backend, policyName str
 	ratios := s.prefixMatches(req)
 	var best *backend.Backend
 	bestScore := math.Inf(1)
+	var evalErrCount int
+	var firstEvalErr error
 	for _, b := range candidates {
 		env := s.BuildEnv(req, b, ratios[b.ID])
 		pass, score, err := p.Eval(env)
 		if err != nil {
+			evalErrCount++
+			if firstEvalErr == nil {
+				firstEvalErr = err
+			}
 			slog.Warn("策略求值失败，跳过该后端", "policy", policyName, "backend", b.ID, "err", err)
 			continue
 		}
@@ -234,6 +401,12 @@ func (s *Scheduler) pickExpression(candidates []*backend.Backend, policyName str
 		}
 	}
 	if best == nil {
+		if evalErrCount > 0 {
+			slog.Error("策略表达式求值失败，拒绝降级绕过约束",
+				"policy", policyName, "model", req.Model,
+				"eval_err_count", evalErrCount, "first_err", firstEvalErr)
+			return nil, fmt.Errorf("策略 %s 表达式求值失败，拒绝降级绕过约束", policyName)
+		}
 		slog.Warn("策略过滤后无候选，降级为最小负载", "policy", policyName, "model", req.Model)
 		return pickLeast(candidates), nil
 	}

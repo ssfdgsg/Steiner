@@ -89,3 +89,25 @@ func TestBadURL(t *testing.T) {
 		t.Fatal("非法 URL 应报错")
 	}
 }
+
+// TestNewClampsNonPositiveWeight 验证 M15：注册/更新时 Weight<=0 钳制为 1，
+// 保证加权调度权重和恒 >0、任何后端至少可被选中（与 ApplyDefaults 语义一致）。
+func TestNewClampsNonPositiveWeight(t *testing.T) {
+	for _, w := range []float64{0, -5} {
+		b, err := New(config.BackendConfig{ID: "w", URL: "http://127.0.0.1:9", Engine: "vllm", Weight: w})
+		if err != nil {
+			t.Fatalf("weight=%v 构造失败: %v", w, err)
+		}
+		if b.Weight != 1 {
+			t.Fatalf("weight=%v 应钳制为 1，实际 %v", w, b.Weight)
+		}
+	}
+	// 正权重原样保留。
+	b, err := New(config.BackendConfig{ID: "w2", URL: "http://127.0.0.1:10", Engine: "vllm", Weight: 3})
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	if b.Weight != 3 {
+		t.Fatalf("正权重应保留，实际 %v", b.Weight)
+	}
+}

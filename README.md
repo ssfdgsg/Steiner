@@ -1,5 +1,7 @@
 # Steiner — LLM 推理负载均衡与调度网关
 
+> 🌐 [English](README.en.md) | 简体中文
+
 > 面向 vLLM 与 SGLang 的 OpenAI 兼容七层网关：以指标驱动、缓存感知的调度提升 LLM 推理集群的吞吐与稳定性。
 
 Steiner 将多种推理引擎收敛为统一的 OpenAI 兼容入口，并提供模型级路由、负载均衡、KV Cache 前缀亲和、PD 分离、可观测性与多实例协调能力。它适合需要在 Kubernetes 或自建集群中统一接入和调度大模型推理服务的团队。
@@ -33,10 +35,10 @@ make up
 - **KV Cache 前缀感知路由**：近似基数树（radix tree）维护「前缀 → 后端」亲和，最大化 prefix cache 命中，失衡时自动回退到负载优先；
 - **PD 分离与 NCCL/NIXL 连接组调度**：prefill / decode 角色化实例配对，仅在已建立 KV 传输通道（NCCL / NIXL / Mooncake）的 P-D 对之间派发请求；
 - **webhook 告警与自动扩缩容信号**：告警规则（与调度算式同一套表达式变量）周期求值，pending/firing/resolved 状态机推送钉钉/飞书/企业微信/Slack/generic webhook；扩缩容建议器产出期望副本数，供外部控制器（K8s operator / HPA / KEDA）落地扩容；
-- **多实例水平部署**：以 Redis 为协调层——分布式限流（GCRA，全集群共享模型配额）、会话粘性共享、策略热更新广播、告警/扩缩容 leader 单主执行、`/admin/cluster` 成员视图；Redis 故障自动降级回本地行为，不影响数据面；
+- **多实例水平部署**：以 Redis 为协调层——分布式限流（GCRA，全集群共享模型配额）、会话粘性共享、策略热更新广播、告警/扩缩容 leader 单主执行、`/admin/cluster` 成员视图；Redis 故障自动降级回本地行为（**可用性取舍**：fail-open 下降级为每实例本地桶，故障期间集群配额可超至 N×，配置 `rate_limit_fail_open: false` 可改为故障时拒绝以严格限额）；
 - **分布式追踪（OpenTelemetry）**：每请求一条 span 链（排队等待 / 每次选路 / 每次重试转发 / TTFT 事件 / token 用量），OTLP 导出，`traceparent` 注入上游可与引擎侧续接全链路；`X-Trace-Id` / `X-Request-Id` 响应头与日志、指标互查；
 - **动态后端注册与配置持久化**：`POST/DELETE /admin/backends` 运行期增删后端（池 copy-on-write 无锁热切换），变更经 PG/MySQL 持久层落库、重启自动恢复，并经集群广播同步全部实例——与扩缩容建议器闭环：外部控制器扩容后调 admin API 即可接流，无需重启；
-- **React 管理控制台**：`/admin/ui/` 开箱即用（产物嵌入二进制，无需部署静态服务）——调度方案一键切换、后端实时负载与增删隔离、调度解释器（回答"为什么路由到 X"）、KV/排队/PD 链路/告警/扩缩容/集群运行态视图；
+- **React 管理控制台**：`/admin/ui/` 开箱即用（产物嵌入二进制，无需部署静态服务；静态壳公开加载，进入后需输入 `server.admin_token` 登录，令牌仅存于浏览器 localStorage）——调度方案一键切换、后端实时负载与增删隔离、调度解释器（回答"为什么路由到 X"）、KV/排队/PD 链路/告警/扩缩容/集群运行态视图；
 - **流式透传、令牌桶限流、会话粘性、熔断摘除、自身可观测性**。
 
 ## 总体架构

@@ -1,5 +1,7 @@
 # internal/policy/ — 策略表达式引擎
 
+> 🌐 [English](README.en.md) | 简体中文
+
 ## 职责
 把配置或管理面提交的**调度算式**（字符串）动态编译为可执行程序，供调度器在热路径上
 对每个候选后端求值。核心特性：
@@ -27,8 +29,11 @@ policies:
 | `model` | string | 请求模型名 |
 | `stream` | bool | 是否流式请求 |
 | `prompt_len` | float | 提示词文本字节长度 |
+| `prompt_tokens` | float | 网关估算的 prompt token 数 |
 | `priority` | float | 请求体 `priority` 字段（缺省 0） |
 | `session` | string | 会话键（X-Session-Id 头或请求体 user 字段） |
+| `is_multimodal` | bool | 请求是否包含图片、音频或视频输入 |
+| `image_count` / `audio_count` / `video_count` | float | 各类多模态输入数量 |
 | `backend` | string | 候选后端 ID |
 | `engine` | string | vllm / vllm_omni / sglang / sglang_omni |
 | `engine_family` | string | vllm / sglang |
@@ -53,6 +58,7 @@ expr 内置函数（`abs/ceil/floor/round/min/max` 等）可直接使用。
 ## 接口（实现见 engine.go）
 ```go
 func NewEngine() *Engine
+func Validate(filter, score string) (normalizedFilter string, errs []ValidationError) // 只编译，不生效
 func (e *Engine) Set(name, filter, score string) error   // 编译并注册/热替换
 func (e *Engine) Get(name string) *Policy
 func (e *Engine) List() map[string]map[string]string     // 源码视图（admin 用）
@@ -81,9 +87,16 @@ func (p *Policy) Eval(env map[string]interface{}) (pass bool, score float64, err
   当前生效方案；生效方案由表达式反查得出（`MatchPreset`），手写表达式显示为 `custom`，
   无需额外存状态，集群各实例判定天然一致。
 
-## 调试
-`GET /admin/explain?model=&prompt=&policy=` 返回逐后端打分明细（升序），
-回答"这条请求为什么会路由到 X"。
+## 管理面编辑与调试
+
+- `POST /admin/policies/validate` 接收 `{filter, score}`，只做语法与结果类型校验，
+  返回 `valid` 和按 `filter` / `score` 区分的错误列表；不注册、不持久化、不改变运行策略。
+  由于编译环境允许未知变量，该接口不能保证 `vars[...]` / `raw[...]` 动态键运行时存在。
+- 控制台提供「可视化构建 / 表达式」双模式。构建器覆盖常用过滤与线性加权代价模型，
+  实时生成 Expr 并调用上述校验接口；复杂函数、括号、map 与混合逻辑保留在表达式模式，
+  不做有损反向转换。
+- `GET /admin/explain?model=&prompt=&policy=` 返回逐后端打分明细（升序），
+  回答"这条请求为什么会路由到 X"。score 是代价，**最小者胜出**。
 
 ## 文件
 | 文件 | 说明 |

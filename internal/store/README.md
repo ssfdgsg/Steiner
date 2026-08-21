@@ -1,5 +1,7 @@
 # internal/store — 动态配置持久层
 
+> 🌐 [English](README.en.md) | 简体中文
+
 admin 运行期变更落库，重启自动恢复。`store.enabled=false`（缺省）时行为与
 无持久层完全一致。支持 **PostgreSQL** 与 **MySQL**，方言差异（`$n`/`?` 占位符、
 `ON CONFLICT`/`ON DUPLICATE KEY` upsert）集中在 `dialect`，DDL 共用两家交集

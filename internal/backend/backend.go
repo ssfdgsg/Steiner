@@ -89,7 +89,7 @@ func New(cfg config.BackendConfig) (*Backend, error) {
 		ID:             cfg.ID,
 		URL:            u,
 		Engine:         EngineType(cfg.Engine),
-		Weight:         cfg.Weight,
+		Weight:         normalizeWeight(cfg.Weight),
 		MaxConcurrency: int64(cfg.MaxConcurrency),
 		MetricsPath:    cfg.MetricsPath,
 		HealthPath:     cfg.HealthPath,
@@ -98,6 +98,16 @@ func New(cfg config.BackendConfig) (*Backend, error) {
 	}
 	b.healthy.Store(true)
 	return b, nil
+}
+
+// normalizeWeight 钳制静态权重：<=0 一律视为 1，保证加权调度（weighted_random）
+// 的权重和恒 >0、每个后端至少可被加权选中。与 config.ApplyDefaults 的后端
+// 默认权重 1 语义一致；注册/更新路径若未先经 ApplyDefaults 也由此兜底。
+func normalizeWeight(w float64) float64 {
+	if w <= 0 {
+		return 1
+	}
+	return w
 }
 
 // Snapshot 返回最近一次指标快照；尚未采集时返回零值快照，避免调用方判空。

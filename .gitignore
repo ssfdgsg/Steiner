@@ -7,6 +7,7 @@
 *.cover
 *.prof
 coverage.out
+/.gocache/
 
 # Frontend dependencies and local build cache
 /web/node_modules/

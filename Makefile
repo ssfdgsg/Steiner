@@ -1,7 +1,7 @@
-# 本机 go 为 1.22.2，固定使用本地工具链，避免自动下载新工具链导致卡死
+# 使用 GVM 当前选择的本地 Go 工具链，避免自动下载其他版本导致卡死
 export GOTOOLCHAIN := local
 
-.PHONY: build test vet fmt smoke tidy bench conformance web web-dev web-install \
+.PHONY: build test stress vet fmt smoke tidy bench conformance web web-dev web-install \
         run image image-selfcontained up down
 
 # 本地直接启动（读 configs/gateway.yaml）。控制台：http://localhost:8080/admin/ui/
@@ -42,6 +42,22 @@ web-dev:
 
 test:
 	go test ./... -count=1
+
+# 压力回归：管理面并发指标写入/聚合、历史缓冲读写和端点轮询启用竞态检测，
+# 数据面验证大 query / response 完整性，随后采集管理面容量基准。
+stress:
+	go test -race ./internal/metrics ./internal/server \
+		-run 'TestAggregateConcurrentStress|TestHistoryConcurrentReadWriteStress|TestStatsEndpointsConcurrentStress' \
+		-count=3
+	go test ./internal/proxy \
+		-run 'TestLargeRequestBodyAndQueryForward|TestLargeNonStreamingResponse|TestLargeStreamingResponse' \
+		-count=1
+	go test ./internal/proxy -run '^$$' \
+		-bench 'BenchmarkParseLargeRequest|BenchmarkLargeRequestForward16MiB' \
+		-benchmem -benchtime=3x -count=1
+	go test ./internal/metrics -run '^$$' \
+		-bench 'BenchmarkAggregateHighCardinality|BenchmarkHistoryFullBufferSample' \
+		-benchmem -benchtime=2s -count=1
 
 vet:
 	go vet ./...

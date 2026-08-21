@@ -1,5 +1,7 @@
 # internal/kvcache/ — KV Cache 前缀感知路由
 
+> 🌐 [English](README.en.md) | 简体中文
+
 ## 职责
 在网关侧近似复刻各后端的 prefix cache 内容分布：维护一棵
 「请求前缀 → 曾服务过该前缀的后端集合」压缩基数树（radix tree），
@@ -21,7 +23,16 @@
   Match 单次下行返回**每个后端**的最长命中字节数；
 - 淘汰：TTL 过期（默认 10m）+ 周期清理（`RunPruner`，默认 30s），
   空叶子节点随之回收；规模统计（字节/节点数）暴露到自身指标与 `GET /admin/kvcache`；
-- 并发：单互斥锁——树操作在微秒级、树规模受 TTL 与前缀上限约束，
+- **内存硬上限（H8）**：`NewTreeWithBudget` 注入节点数（`max_nodes`，默认 10 万）
+  与边字节数（`max_bytes`，默认 256MiB）双维度预算，任一超限时 Insert 按
+  "最久未访问归属"逐代淘汰（复用 TTL 剪枝，每轮剔除全树最旧代际）并回收空节点，
+  为新插入腾空间——异常/高基数输入下树规模有界，不依赖 TTL 兜底；
+  `NewTree`（无预算）保持向后兼容；预算为 0 表示该维度不限；
+- **后端摘除联动（L4）**：`RemoveBackedBy(backendID)` 批量清除树内该后端的
+  死归属并回收节点；装配层经 `Registry.SetBackendRemovedHook` 在后端摘除
+  （RemoveBackend 或 Upsert 替换）时调用，避免死归属残留至 TTL 过期、
+  以及同 ID 重注册"继承"旧归属把亲和路由引向尚未持有 KV cache 的新实例；
+- 并发：单互斥锁——树操作在微秒级、树规模受 TTL、前缀上限与内存预算约束，
   实测无需分片；如未来成为瓶颈，可按根首字节分 256 片（各分片天然独立）。
 
 ## 自研特例说明（按 CLAUDE.md 架构优先级要求留痕）

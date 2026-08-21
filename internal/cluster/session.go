@@ -55,3 +55,67 @@ func (s *SessionStore) Bind(key, backendID string) {
 		s.m.errHook("session")
 	}
 }
+
+// Unbind 解除单个会话的绑定：Redis 共享键与本地热副本同步删除。
+// 供失效绑定清理路径使用（如 Lookup 命中指向已摘除/不可用后端的绑定）；
+// Redis 故障时降级为仅清本地并上报错误，不阻断调用方。
+func (s *SessionStore) Unbind(key string) {
+	if key == "" {
+		return
+	}
+	s.local.Unbind(key)
+	ctx, cancel := context.WithTimeout(context.Background(), s.m.cfg.OpTimeout.D())
+	defer cancel()
+	if err := s.m.rdb.Del(ctx, s.m.key("session", key)).Err(); err != nil {
+		s.m.errHook("session")
+	}
+}
+
+// InvalidateBackend 后端下线/摘除时跨集群批量清除其全部会话绑定：
+// 本地热副本 + 扫描 Redis 共享表删除所有指向该后端的绑定键。
+// 健康翻转回调与后端摘除钩子调用之（M14：不再只清本地表）。
+// Redis 故障时降级为仅本地生效并上报错误，本地行为始终正确。
+func (s *SessionStore) InvalidateBackend(backendID string) {
+	s.local.InvalidateBackend(backendID)
+	ctx, cancel := context.WithTimeout(context.Background(), s.m.cfg.OpTimeout.D())
+	defer cancel()
+	if err := s.deleteSharedByBackend(ctx, backendID); err != nil {
+		s.m.errHook("session")
+	}
+}
+
+// deleteSharedByBackend 用 SCAN 枚举共享绑定键，批量取出值与 backendID 比对，
+// 只删除匹配者（避免 DELETE 误伤期间被改绑到其他后端的键）。跨实例并发
+// 改绑与清除存在天然竞态，但清除是自愈式的：残留绑定会被下一次 Lookup
+// 命中后在代理层解除，或由下一次摘除/健康翻转再次清理。
+func (s *SessionStore) deleteSharedByBackend(ctx context.Context, backendID string) error {
+	match := s.m.key("session", "*")
+	var cursor uint64
+	for {
+		keys, next, err := s.m.rdb.Scan(ctx, cursor, match, 64).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			vals, err := s.m.rdb.MGet(ctx, keys...).Result()
+			if err != nil {
+				return err
+			}
+			var toDelete []string
+			for i, v := range vals {
+				if id, ok := v.(string); ok && id == backendID {
+					toDelete = append(toDelete, keys[i])
+				}
+			}
+			if len(toDelete) > 0 {
+				if err := s.m.rdb.Del(ctx, toDelete...).Err(); err != nil {
+					return err
+				}
+			}
+		}
+		if next == 0 {
+			return nil
+		}
+		cursor = next
+	}
+}

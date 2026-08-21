@@ -1,5 +1,7 @@
 # internal/proxy/ — 转发执行层
 
+> 🌐 [English](README.en.md) | 简体中文
+
 ## 职责
 OpenAI 兼容 API 的反向代理：请求解析 → 限流 → 会话粘性/排队 → 调度 → 转发。
 

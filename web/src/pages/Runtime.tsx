@@ -1,232 +1,395 @@
-// 运行态页：KV 前缀树、容量排队、PD 组与 NCCL 链路、告警、扩缩容建议、集群成员。
-import { api, type AlertsResp, type AutoscaleResp, type ClusterResp, type KVCacheResp, type PDGroup, type QueueResp } from '../api'
-import { usePoll } from '../hooks'
-import { Empty, Section } from '../components'
-import { bytes, num } from '../format'
+// 运行监控：集群请求趋势、PD 分离链路、金丝雀发布与集群成员。
+// 只做观测与诊断，不混入实例注册或策略编辑（写操作集中在对应页面）。
+import { useState } from 'react'
+import { api, type PDGroup, type RolloutView } from '../api'
+import { useInterval, usePoll, useRefreshControl, useToast } from '../hooks'
+import {
+  Async,
+  ConfirmDialog,
+  FeatureBadge,
+  type Column,
+  DataTable,
+  MetricCard,
+  Notice,
+  Panel,
+  Segmented,
+  StateBlock,
+  Toast,
+} from '../components'
+import { LineChart } from '../charts'
+import { summarize, toPoint } from './Overview'
+import { clock, ms, num, pct, stamp } from '../format'
+
+const RANGES = [
+  { value: 15, label: '15 分钟' },
+  { value: 60, label: '1 小时' },
+  { value: 180, label: '3 小时' },
+  { value: 360, label: '6 小时' },
+]
 
 export function Runtime() {
-  const kv = usePoll<KVCacheResp>(() => api.kvcache(), 4000)
-  const queue = usePoll<QueueResp>(() => api.queue(), 2000)
-  const pd = usePoll<Record<string, PDGroup>>(() => api.pd(), 4000)
-  const alerts = usePoll<AlertsResp>(() => api.alerts(), 5000)
-  const scale = usePoll<AutoscaleResp>(() => api.autoscale(), 5000)
-  const cluster = usePoll<ClusterResp>(() => api.cluster(), 5000)
+  const { nonce } = useRefreshControl()
+  const base = useInterval()
+  const [minutes, setMinutes] = useState(60)
 
-  const pdGroups = Object.entries(pd.data ?? {})
+  const stats = usePoll(api.stats, base, nonce)
+  const history = usePoll(() => api.history(minutes), base, nonce)
+  const pd = usePoll(api.pd, base * 2, nonce)
+  const cluster = usePoll(api.cluster, base * 2, nonce)
+  const rollouts = usePoll(api.rollouts, base * 2, nonce)
 
   return (
     <>
-      <div className="page-head">
-        <div>
-          <h1>运行态</h1>
-          <p className="page-desc">
-            KV 前缀树、容量排队、PD 分离链路、告警与扩缩容建议、集群成员的实时视图。
-          </p>
-        </div>
+      <p className="page-desc">
+        网关侧观测视图。吞吐与时延取自内存采样缓冲（重启清空）；PD 链路与集群成员为即时状态。
+      </p>
+
+      <div className="kpis">
+        <MetricCard
+          label="累计请求"
+          icon="overview"
+          value={stats.data ? stats.data.aggregate.requests_total.toLocaleString('zh-CN') : '-'}
+          foot={stats.data ? <span>错误率 {pct(stats.data.aggregate.error_rate, 2)}</span> : undefined}
+        />
+        <MetricCard
+          label="可用后端"
+          icon="server"
+          tone="success"
+          value={stats.data ? String(stats.data.backends.available) : '-'}
+          unit={stats.data ? `/ ${stats.data.backends.total}` : undefined}
+          foot={stats.data ? <span>在途请求 {stats.data.backends.inflight}</span> : undefined}
+        />
+        <MetricCard
+          label="P95 延迟"
+          icon="latency"
+          tone="info"
+          value={ms(stats.data?.aggregate.latency.p95_ms)}
+          foot={
+            stats.data ? (
+              <span>
+                均值 {ms(stats.data.aggregate.latency.avg_ms)} · TTFT P95{' '}
+                {ms(stats.data.aggregate.ttft.p95_ms)}
+              </span>
+            ) : undefined
+          }
+        />
+        <MetricCard
+          label="队列深度"
+          icon="queue"
+          tone="warning"
+          value={
+            stats.data?.queue.enabled ? String(stats.data.queue.depth ?? 0) : '未启用'
+          }
+          foot={
+            stats.data?.queue.enabled ? (
+              <span>上限 {stats.data.queue.max_depth ?? '—'}</span>
+            ) : (
+              <span>容量排队未配置</span>
+            )
+          }
+        />
       </div>
 
-      <div className="grid">
-        <Section title="KV 前缀树">
-          {kv.data?.enabled ? (
-            <table>
-              <tbody>
-                <tr>
-                  <th>占用字节</th>
-                  <td className="num">{bytes(kv.data.stats?.bytes)}</td>
-                </tr>
-                <tr>
-                  <th>节点数</th>
-                  <td className="num">{num(kv.data.stats?.nodes)}</td>
-                </tr>
-              </tbody>
-            </table>
-          ) : (
-            <Empty text="未启用（kv_cache.enabled=false）" />
-          )}
-        </Section>
+      <Panel
+        title="吞吐与时延趋势"
+        subtitle={history.data?.interval_seconds ? `采样间隔 ${history.data.interval_seconds}s` : undefined}
+        tools={
+          <Segmented
+            ariaLabel="时间范围"
+            value={minutes}
+            options={RANGES}
+            onChange={setMinutes}
+          />
+        }
+      >
+        <Async state={history}>
+          {(d) =>
+            !d.enabled ? (
+              <StateBlock kind="disabled" title="时序采样未启用" />
+            ) : (
+              <div className="stack">
+                <LineChart
+                  height={260}
+                  series={[
+                    { name: 'RPS', color: 'var(--series-1)', points: (d.samples ?? []).map(toPoint('rps')) },
+                  ]}
+                  yFormat={(v) => num(v, 1)}
+                  xFormat={(x) => clock(new Date(x).toISOString())}
+                  summary={summarize(d.samples ?? [], 'rps', (v) => `${num(v, 2)} RPS`)}
+                />
+                <LineChart
+                  height={220}
+                  series={[
+                    {
+                      name: '平均时延',
+                      color: 'var(--series-2)',
+                      points: (d.samples ?? []).map(toPoint('latency_avg_ms')),
+                    },
+                    {
+                      name: 'P95 时延',
+                      color: 'var(--series-3)',
+                      points: (d.samples ?? []).map(toPoint('latency_p95_ms')),
+                    },
+                  ]}
+                  yFormat={(v) => `${Math.round(v)}ms`}
+                  xFormat={(x) => clock(new Date(x).toISOString())}
+                  summary={summarize(d.samples ?? [], 'latency_p95_ms', (v) => ms(v))}
+                />
+              </div>
+            )
+          }
+        </Async>
+      </Panel>
 
-        <Section title="容量排队">
-          {queue.data?.enabled ? (
-            <>
-              <table>
-                <tbody>
-                  <tr>
-                    <th>当前深度</th>
-                    <td className="num">{num(queue.data.depth)}</td>
-                  </tr>
-                  <tr>
-                    <th>深度上限</th>
-                    <td className="num">{num(queue.data.max_depth)}</td>
-                  </tr>
-                  <tr>
-                    <th>等待上限</th>
-                    <td className="num">{queue.data.max_wait ?? '-'}</td>
-                  </tr>
-                </tbody>
-              </table>
-              {Object.keys(queue.data.by_model ?? {}).length > 0 && (
-                <>
-                  <p className="hint" style={{ marginBottom: 4 }}>按模型：</p>
+      <Panel title="PD 分离组与链路">
+        <Async state={pd}>
+          {(groups) => {
+            const names = Object.keys(groups)
+            if (!names.length)
+              return (
+                <StateBlock
+                  kind="disabled"
+                  title="未配置 PD 分离"
+                  detail="Prefill/Decode 分离需要在配置中声明 pd_groups，拓扑不支持动态变更。"
+                />
+              )
+            return (
+              <div className="stack">
+                {names.map((n) => (
+                  <PDGroupBlock key={n} name={n} group={groups[n]} />
+                ))}
+              </div>
+            )
+          }}
+        </Async>
+      </Panel>
+
+      <div className="cols-2">
+        <Panel
+          title="金丝雀发布"
+          tools={<FeatureBadge enabled={rollouts.data?.enabled} />}
+        >
+          <Async state={rollouts}>
+            {(d) =>
+              !d.enabled ? (
+                <StateBlock kind="disabled" title="未配置金丝雀发布" />
+              ) : (
+                <RolloutTable rollouts={d.rollouts ?? []} onDone={rollouts.refresh} />
+              )
+            }
+          </Async>
+        </Panel>
+
+        <Panel title="集群成员" tools={<FeatureBadge enabled={cluster.data?.enabled} />}>
+          <Async state={cluster}>
+            {(d) =>
+              !d.enabled ? (
+                <StateBlock
+                  kind="disabled"
+                  title="单机部署"
+                  detail="未启用集群协调，策略与后端变更仅作用于本实例。"
+                />
+              ) : (
+                <div className="table-wrap">
                   <table>
+                    <thead>
+                      <tr>
+                        <th>实例</th>
+                        <th>地址</th>
+                        <th>角色</th>
+                      </tr>
+                    </thead>
                     <tbody>
-                      {Object.entries(queue.data.by_model ?? {}).map(([m, d]) => (
-                        <tr key={m}>
-                          <th>{m}</th>
-                          <td className="num">{d}</td>
+                      {(d.members ?? []).map((m) => (
+                        <tr key={m.id}>
+                          <td className="mono">
+                            {m.id}
+                            {m.id === d.self && (
+                              <span className="badge accent" style={{ marginLeft: 8 }}>
+                                本机
+                              </span>
+                            )}
+                          </td>
+                          <td className="mono">{m.addr ?? '—'}</td>
+                          <td>
+                            {m.leader ? (
+                              <span className="badge ok">Leader</span>
+                            ) : (
+                              <span className="badge muted">Follower</span>
+                            )}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                </>
-              )}
-            </>
-          ) : (
-            <Empty text="未启用（queue.enabled=false）" />
-          )}
-        </Section>
+                </div>
+              )
+            }
+          </Async>
+        </Panel>
+      </div>
+    </>
+  )
+}
 
-        <Section title="集群">
-          {cluster.data?.enabled ? (
+function PDGroupBlock({ name, group }: { name: string; group: PDGroup }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="preset-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+      <div className="row">
+        <strong className="mono">{name}</strong>
+        <span className="badge accent">{group.strategy || '默认策略'}</span>
+        <span className="hint">策略槽位 {group.policy || 'default'}</span>
+        <span className="hint">
+          Prefill {group.prefill.length} · Decode {group.decode.length} · 链路{' '}
+          {group.links?.length ?? 0}
+        </span>
+        <button className="btn sm ghost" style={{ marginLeft: 'auto' }} onClick={() => setOpen((v) => !v)}>
+          {open ? '收起链路' : '展开链路'}
+        </button>
+      </div>
+      {open &&
+        (group.links?.length ? (
+          <div className="table-wrap" style={{ marginTop: 10 }}>
             <table>
               <thead>
                 <tr>
-                  <th>实例</th>
-                  <th>角色</th>
+                  <th>Prefill</th>
+                  <th>Decode</th>
+                  <th style={{ textAlign: 'right' }}>带宽 Gbps</th>
+                  <th style={{ textAlign: 'right' }}>在途 KV 传输</th>
                 </tr>
               </thead>
               <tbody>
-                {(cluster.data.members ?? []).map((m) => (
-                  <tr key={m.id}>
-                    <td>
-                      {m.id}
-                      {m.id === cluster.data?.self && <span className="badge"> 本机</span>}
+                {group.links.map((l) => (
+                  <tr key={`${l.prefill}-${l.decode}`}>
+                    <td className="mono">{l.prefill}</td>
+                    <td className="mono">{l.decode}</td>
+                    <td className="num" style={{ textAlign: 'right' }}>
+                      {num(l.bandwidth_gbps, 1)}
                     </td>
-                    <td>
-                      {m.leader ? <span className="badge accent">leader</span> : <span className="badge">follower</span>}
+                    <td className="num" style={{ textAlign: 'right' }}>
+                      {l.inflight}
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          ) : (
-            <Empty text="单机部署（cluster.enabled=false）" />
-          )}
-        </Section>
-      </div>
-
-      <div className="card">
-        <h2>PD 分离组与 NCCL 链路</h2>
-        {pdGroups.length === 0 ? (
-          <Empty text="未配置 PD 分离组" />
+          </div>
         ) : (
-          pdGroups.map(([name, g]) => (
-            <div key={name} style={{ marginBottom: 16 }}>
-              <div className="row" style={{ marginBottom: 8 }}>
-                <strong>{name}</strong>
-                <span className="badge">策略 {g.strategy}</span>
-                {g.strategy === 'expression' && <span className="badge">{g.policy}</span>}
-                <span className="hint">
-                  prefill: {g.prefill.join(', ')} ｜ decode: {g.decode.join(', ')}
-                </span>
-              </div>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>prefill</th>
-                      <th>decode</th>
-                      <th>带宽 Gbps</th>
-                      <th>在途 KV 传输</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {g.links.map((l) => (
-                      <tr key={`${l.prefill}->${l.decode}`}>
-                        <td>{l.prefill}</td>
-                        <td>{l.decode}</td>
-                        <td className="num">{num(l.bandwidth_gbps)}</td>
-                        <td className="num">{l.inflight}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          ))
-        )}
-      </div>
+          <div style={{ marginTop: 10 }}>
+            <Notice>该组暂无链路状态上报。</Notice>
+          </div>
+        ))}
+    </div>
+  )
+}
 
-      <div className="grid">
-        <Section title="告警">
-          {!alerts.data?.enabled ? (
-            <Empty text="未启用（alerting.enabled=false）" />
-          ) : (alerts.data.active ?? []).length === 0 ? (
-            <Empty text="当前无活跃告警" />
-          ) : (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>规则</th>
-                    <th>实例</th>
-                    <th>状态</th>
-                    <th>说明</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(alerts.data.active ?? []).map((a, i) => (
-                    <tr key={`${a.rule}-${a.instance}-${i}`}>
-                      <td>{a.rule}</td>
-                      <td>{a.instance}</td>
-                      <td>
-                        <span className={a.status === 'firing' ? 'badge err' : 'badge warn'}>
-                          {a.status}
-                        </span>
-                      </td>
-                      <td className="hint">{a.summary ?? ''}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Section>
+function RolloutTable({ rollouts, onDone }: { rollouts: RolloutView[]; onDone: () => void }) {
+  const { toast, show } = useToast()
+  const [resetting, setResetting] = useState<RolloutView | null>(null)
+  const [busy, setBusy] = useState(false)
 
-        <Section title="扩缩容建议">
-          {!scale.data?.enabled ? (
-            <Empty text="未启用（autoscale.enabled=false）" />
-          ) : (scale.data.recommendations ?? []).length === 0 ? (
-            <Empty text="暂无建议" />
-          ) : (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>模型</th>
-                    <th>当前</th>
-                    <th>建议</th>
-                    <th>方向</th>
-                    <th>原因</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(scale.data.recommendations ?? []).map((r) => (
-                    <tr key={r.model}>
-                      <td>{r.model}</td>
-                      <td className="num">{num(r.current_replicas)}</td>
-                      <td className="num">{num(r.desired_replicas)}</td>
-                      <td>
-                        <span className="badge">{r.direction ?? '-'}</span>
-                      </td>
-                      <td className="hint">{r.reason ?? ''}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Section>
-      </div>
+  const columns: Column<RolloutView>[] = [
+    { key: 'model', title: '模型', sortValue: (r) => r.model, render: (r) => <span className="mono">{r.model}</span> },
+    { key: 'canary', title: '金丝雀池', render: (r) => <span className="mono">{r.canary}</span> },
+    {
+      key: 'state',
+      title: '状态',
+      render: (r) => {
+        const cls =
+          r.state === 'failed' ? 'err' : r.state === 'completed' ? 'ok' : r.state === 'running' ? 'accent' : 'muted'
+        return <span className={`badge ${cls}`}>{r.state}</span>
+      },
+    },
+    {
+      key: 'step',
+      title: '阶段',
+      align: 'right',
+      render: (r) => (
+        <span className="num">
+          {r.step_index + 1} / {r.steps?.length || 1}
+        </span>
+      ),
+    },
+    {
+      key: 'weight',
+      title: '分流权重',
+      align: 'right',
+      sortValue: (r) => r.canary_weight,
+      render: (r) => <span className="num">{pct(r.canary_weight)}</span>,
+    },
+    {
+      key: 'err',
+      title: '错误率 金丝雀/稳定',
+      align: 'right',
+      render: (r) => (
+        <span className="num">
+          {pct(r.canary_error_rate, 2)} / {pct(r.stable_error_rate, 2)}
+        </span>
+      ),
+    },
+    {
+      key: 'ttft',
+      title: 'TTFT P95 金丝雀/稳定',
+      align: 'right',
+      render: (r) => (
+        <span className="num">
+          {ms(r.canary_ttft_p95 * 1000)} / {ms(r.stable_ttft_p95 * 1000)}
+        </span>
+      ),
+    },
+    { key: 'since', title: '阶段开始', render: (r) => <span className="hint">{stamp(r.step_since)}</span> },
+    {
+      key: 'actions',
+      title: '操作',
+      align: 'right',
+      render: (r) => (
+        <span className="cell-actions">
+          <button
+            className="btn sm"
+            onClick={(e) => {
+              e.stopPropagation()
+              setResetting(r)
+            }}
+          >
+            重新发布
+          </button>
+        </span>
+      ),
+    },
+  ]
+
+  return (
+    <>
+      <DataTable columns={columns} rows={rollouts} rowKey={(r) => r.model} empty="暂无发布计划" />
+      {resetting && (
+        <ConfirmDialog
+          title="重新开始金丝雀发布"
+          confirmText="确认重置"
+          busy={busy}
+          onCancel={() => setResetting(null)}
+          onConfirm={async () => {
+            setBusy(true)
+            try {
+              await api.resetRollout(resetting.model)
+              show('ok', `${resetting.model} 已从第一阶段重新发布`)
+              setResetting(null)
+              onDone()
+            } catch (e) {
+              show('err', e instanceof Error ? e.message : String(e))
+            } finally {
+              setBusy(false)
+            }
+          }}
+        >
+          <div>
+            模型 <code className="mono">{resetting.model}</code> 的发布将回到第一阶段，分流权重按首个阶段重设。
+          </div>
+          <div>权重是每实例内存态，集群下各网关实例会各自按同一份发布配置重新推进。</div>
+        </ConfirmDialog>
+      )}
+      <Toast toast={toast} />
     </>
   )
 }

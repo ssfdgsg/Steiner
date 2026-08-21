@@ -3,8 +3,10 @@ package backend
 
 import (
 	"testing"
+	"time"
 
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/kvcache"
 )
 
 func dynCfg() *config.Config {
@@ -51,9 +53,10 @@ func TestAddRemoveBackend(t *testing.T) {
 	if len(rt.Pool()) != 2 || reg.Get("b1") != nil {
 		t.Fatalf("摘除后全池状态不符: %d", len(rt.Pool()))
 	}
-	// 子池同步收缩：s1 只有 b1，摘除后应为空。
-	if n := len(rt.Splits[0].Pool()); n != 0 {
-		t.Fatalf("子池 s1 应为空，实际 %d", n)
+	// 子池同步收缩：AddBackend(b3) 后按 H10 契约 s1=[b1,b3]、s2=[b2,b3]；
+	// 摘除 b1 后 s1 应只剩 b3（从子池移除，与新后端入池保持对称）。
+	if pool := rt.Splits[0].Pool(); len(pool) != 1 || pool[0].ID != "b3" {
+		t.Fatalf("子池 s1 应只剩 b3，实际 %d 个", len(pool))
 	}
 }
 
@@ -103,5 +106,70 @@ func TestUpsertBackend(t *testing.T) {
 	}
 	if n := len(reg.All()); n != 2 {
 		t.Fatalf("upsert 后总数应为 2，实际 %d", n)
+	}
+}
+
+// TestRemoveBackendInvokesRemovedHook L4 回归(缺陷翻转)：修复前后端摘除
+// 只改路由池，旁路状态（kvcache 前缀树归属）无联动清理入口；修复后摘除
+// 链路上回调装配层注入的 hook（RemoveBackend 与 Upsert 替换旧实例均触发）。
+func TestRemoveBackendInvokesRemovedHook(t *testing.T) {
+	reg, err := NewRegistry(dynCfg())
+	if err != nil {
+		t.Fatalf("构建注册表失败: %v", err)
+	}
+	var removed []string
+	reg.SetBackendRemovedHook(func(id string) { removed = append(removed, id) })
+
+	if err := reg.RemoveBackend("b1"); err != nil {
+		t.Fatalf("摘除失败: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != "b1" {
+		t.Fatalf("摘除回调应收到 b1，实际 %v", removed)
+	}
+	// 不存在的 ID：报错且不触发回调。
+	if err := reg.RemoveBackend("不存在"); err == nil {
+		t.Fatal("摘除不存在的后端应报错")
+	}
+	if len(removed) != 1 {
+		t.Fatalf("失败路径不应触发回调: %v", removed)
+	}
+	// Upsert 替换同 ID 旧实例同样触发：新实例不"继承"旧归属（L4 危害点）。
+	// b1 已摘除，用仍存在的 b2 验证替换路径。
+	bc := config.BackendConfig{ID: "b2", URL: "http://127.0.0.1:200", Engine: "vllm"}
+	bc.ApplyDefaults()
+	if _, err := reg.UpsertBackend(bc, []string{"m1"}); err != nil {
+		t.Fatalf("upsert 失败: %v", err)
+	}
+	if len(removed) != 2 || removed[1] != "b2" {
+		t.Fatalf("替换旧实例应触发回调: %v", removed)
+	}
+}
+
+// TestRemoveBackendCleansTreeOwners L4 端到端（registry × kvcache 树）：
+// 摘除后端后，前缀树内该后端的归属立即清空（不等 TTL），其他后端不受影响。
+func TestRemoveBackendCleansTreeOwners(t *testing.T) {
+	reg, err := NewRegistry(dynCfg())
+	if err != nil {
+		t.Fatalf("构建注册表失败: %v", err)
+	}
+	// 装配层接线：树创建后注入摘除回调（等价 cmd/gateway/main.go 的接线）。
+	tr := kvcache.NewTree(4096, time.Hour) // TTL 1 小时：残留窗口极长，更暴露 L4
+	reg.SetBackendRemovedHook(func(id string) { tr.RemoveBackedBy(id) })
+
+	tr.Insert("system:公共提示词\nuser:你好", "b1")
+	tr.Insert("system:公共提示词\nuser:你好", "b2")
+	if best, _ := tr.Match("system:公共提示词\nuser:你好"); best["b1"] == 0 {
+		t.Fatalf("前置条件失败：b1 应有归属: %v", best)
+	}
+
+	if err := reg.RemoveBackend("b1"); err != nil {
+		t.Fatalf("摘除失败: %v", err)
+	}
+	best, _ := tr.Match("system:公共提示词\nuser:你好")
+	if _, ok := best["b1"]; ok {
+		t.Fatalf("L4 修复失败：摘除后树内仍残留 b1 归属（应联动清理）: %v", best)
+	}
+	if best["b2"] == 0 {
+		t.Fatalf("b2 的归属不应被误删: %v", best)
 	}
 }

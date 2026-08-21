@@ -150,9 +150,11 @@ func (e *Engine) instances(scope string, now time.Time) map[string]map[string]in
 // evalInstance 求值单个实例并驱动状态机，返回该实例当前是否 firing。
 func (e *Engine) evalInstance(r *compiledRule, instance string, env map[string]interface{}, now time.Time) bool {
 	active := false
+	evalErr := false
 	if out, err := vm.Run(r.prog, env); err != nil {
-		// 求值失败按"不满足"处理，只记日志，不打断整轮求值。
-		slog.Warn("告警规则求值失败", "rule", r.cfg.Name, "instance", instance, "err", err)
+		// 求值错误不驱动状态机：只记日志，保留该实例现状，留待下轮重估。
+		evalErr = true
+		slog.Warn("告警规则求值失败，跳过本轮状态机", "rule", r.cfg.Name, "instance", instance, "err", err)
 	} else if b, ok := out.(bool); ok {
 		active = b
 	}
@@ -161,6 +163,12 @@ func (e *Engine) evalInstance(r *compiledRule, instance string, env map[string]i
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	st := e.states[key]
+
+	if evalErr {
+		// 求值错误绝不驱动跃迁：不改变 firing/pending、不删除状态、不发任何事件，
+		// 仅按现有状态参与本轮 firing 计数，等表达式恢复合法后由正常分支继续推进。
+		return st != nil && st.firing
+	}
 
 	if !active {
 		if st != nil {

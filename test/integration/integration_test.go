@@ -42,6 +42,7 @@ func baseConfig(t *testing.T, redisAddr, instanceID string, backendURLs map[stri
 	t.Helper()
 	cfg := &config.Config{
 		Models: []config.ModelRoute{{Name: "m1", Strategy: "round_robin"}},
+		Server: config.ServerConfig{AdminToken: "it-token"},
 		Cluster: config.ClusterConfig{
 			Enabled:           true,
 			RedisAddr:         redisAddr,
@@ -231,6 +232,8 @@ func TestPolicyBroadcastAcrossInstances(t *testing.T) {
 
 	body := `{"filter":"healthy","score":"waiting * 3.0"}`
 	req := httptest.NewRequest("PUT", "/admin/policies/it-policy", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer it-token")
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	g1.handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

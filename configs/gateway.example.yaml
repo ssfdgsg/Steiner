@@ -1,7 +1,8 @@
 # ai-gateway 全量配置示例（字段与 internal/config/config.go 一一对应）
 
 server:
-  listen: ":8080"                    # 业务、指标与管理接口共用端口
+  listen: "127.0.0.1:8080"           # 默认仅本机回环；对外暴露改 0.0.0.0:8080
+  admin_token: "change-me"           # 必填：管理面 /admin/* 的 Bearer 令牌，未配置拒绝启动                    # 业务、指标与管理接口共用端口
   max_body_bytes: 33554432           # 32MiB；多模态(omni)请求体较大，按需调高
   retries: 2                         # 未写出任何字节前的换后端重试次数
   upstream_connect_timeout: 3s
@@ -31,6 +32,8 @@ kv_cache:                            # KV 前缀感知路由
   prune_interval: 30s
   match_threshold: 0.3               # cache_aware 走亲和所需最小前缀命中率
   balance_abs_threshold: 32          # 双阈值失衡判定，超限回退最小负载
+  max_nodes: 100000                 # 内存硬上限：前缀树节点数预算（0=不限，H8）
+  max_bytes: 268435456              # 内存硬上限：前缀边字节预算，默认 256MiB（0=不限，H8）
   balance_rel_threshold: 1.5
 
 policies:                            # 调度策略表达式（strategy=expression 时引用）
@@ -125,6 +128,7 @@ queue:                               # 容量排队：无可用容量时短暂�
 alerting:                            # 指标告警：规则表达式周期求值 + webhook 推送
   enabled: true
   interval: 5s
+  dedupe_firing_window: 5m           # M13：leader 翻转/重启后连续 firing 去重窗（无 resolved 间隔只发一条）；0=关闭
   webhooks:
     - name: ops-dingtalk             # 运维群机器人
       url: https://oapi.dingtalk.com/robot/send?access_token=xxx

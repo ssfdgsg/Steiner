@@ -112,7 +112,16 @@ type Registry struct {
 	all          []*Backend
 	routes       map[string]*Route
 	defaultRoute *Route
+	// removedHook 后端摘除回调（L4）：由装配层注入，用于联动清理依赖该
+	// 后端的旁路状态（如 kvcache 前缀树中的死归属）。持 r.mu 调用，
+	// 回调不得反向获取注册表锁。
+	removedHook BackendRemovedHook
 }
+
+// BackendRemovedHook 后端被摘除（RemoveBackend 或 Upsert 替换旧实例）时的
+// 回调，参数为被摘除后端的 ID。装配层注入，如
+// registry.SetBackendRemovedHook(tree.RemoveBackedBy)。
+type BackendRemovedHook func(id string)
 
 // NewRegistry 由配置构建注册表。
 func NewRegistry(cfg *config.Config) (*Registry, error) {
@@ -248,8 +257,13 @@ func (r *Registry) upsertLocked(bc config.BackendConfig, models []string) (*Back
 	r.byID[b.ID] = b
 	r.all = append(r.all, b)
 	for _, rt := range targets {
-		pool := append(append([]*Backend{}, rt.Pool()...), b)
-		rt.SetPool(pool)
+		rt.SetPool(withBackend(rt.Pool(), b))
+		// 分池路由：新后端与全池保持一致，同步追加到每一个子池（去重），
+		// 否则子池内永远选不中它（H10）。RemoveBackend 的 removeLocked 已按
+		// 同一语义从子池收缩，增删两侧保持对称。
+		for _, sp := range rt.Splits {
+			sp.SetPool(withBackend(sp.Pool(), b))
+		}
 	}
 	return b, nil
 }
@@ -267,7 +281,8 @@ func (r *Registry) RemoveBackend(id string) error {
 	return nil
 }
 
-// removeLocked 持锁摘除：从注册表、全部路由池与子池中移除实例。
+// removeLocked 持锁摘除：从注册表、全部路由池与子池中移除实例，
+// 并通知装配层注入的摘除回调（L4）清理旁路状态（如 kvcache 死归属）。
 func (r *Registry) removeLocked(b *Backend) {
 	delete(r.byID, b.ID)
 	all := make([]*Backend, 0, len(r.all)-1)
@@ -283,6 +298,18 @@ func (r *Registry) removeLocked(b *Backend) {
 			sp.SetPool(without(sp.Pool(), b))
 		}
 	}
+	if r.removedHook != nil {
+		r.removedHook(b.ID)
+	}
+}
+
+// SetBackendRemovedHook 注入后端摘除回调（同一时刻仅一个，装配层设置）。
+// 回调在 RemoveBackend 摘除与 Upsert 替换旧实例时都会触发；
+// 保持回调轻量（不得反向调用注册表方法，避免锁重入）。
+func (r *Registry) SetBackendRemovedHook(h BackendRemovedHook) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.removedHook = h
 }
 
 // without 返回剔除指定后端后的新切片（原切片不动，copy-on-write）。
@@ -294,4 +321,18 @@ func without(pool []*Backend, b *Backend) []*Backend {
 		}
 	}
 	return out
+}
+
+// withBackend 返回追加指定后端后的新切片（copy-on-write）；已存在时不再
+// 重复追加（去重），保证全池 = 各子池并集（去重）的不变量在动态增删下成立。
+func withBackend(pool []*Backend, b *Backend) []*Backend {
+	out := make([]*Backend, 0, len(pool)+1)
+	for _, x := range pool {
+		if x == b {
+			// 已在池中：原样复制（保持顺序），末尾不追加。
+			return append(out, pool[len(out):]...)
+		}
+		out = append(out, x)
+	}
+	return append(out, b)
 }

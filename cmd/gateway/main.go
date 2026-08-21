@@ -35,6 +35,13 @@ import (
 
 var version = "dev"
 
+// 管理面时序缓冲规格：采样间隔与保留点数（15s × 1440 ≈ 6 小时）。
+// 控制台自助排障够用，不做配置项以免与 Prometheus 的职责边界混淆。
+const (
+	statsSampleInterval = 15 * time.Second
+	statsSampleCapacity = 1440
+)
+
 func main() {
 	configPath := flag.String("config", "configs/gateway.yaml", "配置文件路径")
 	showVersion := flag.Bool("version", false, "打印版本后退出")
@@ -85,10 +92,13 @@ func run(configPath string) error {
 		}
 	}
 
-	// KV 前缀树（可关闭）。
+	// KV 前缀树（可关闭）。H8：创建时注入内存硬上限（节点数/边字节数，
+	// 超限逐代淘汰最久未访问归属）；L4：后端摘除时联动清理树内死归属。
 	var tree *kvcache.Tree
 	if cfg.KVCache.Enabled {
-		tree = kvcache.NewTree(cfg.KVCache.MaxPrefixBytes, cfg.KVCache.TTL.D())
+		tree = kvcache.NewTreeWithBudget(cfg.KVCache.MaxPrefixBytes, cfg.KVCache.TTL.D(),
+			cfg.KVCache.MaxNodes, cfg.KVCache.MaxBytes)
+		reg.SetBackendRemovedHook(func(id string) { tree.RemoveBackedBy(id) })
 	}
 
 	sched := scheduler.New(pol, tree, cfg.KVCache)
@@ -148,6 +158,12 @@ func run(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// sessStore 为实际注入代理的会话存储：集群共享模式下是 cluster.SessionStore
+	//（本地热副本 + Redis 共享表），本地模式下退化为 session.Store。健康翻转与
+	// 后端摘除钩子统一对它做失效清理，M14 修复后不再只清本地表。
+	// 声明须先于下方引用它的闭包（后端摘除广播、健康翻转回调）。
+	var sessStore proxy.SessionStore
+
 	// 集群协调层（可选）：连不上 Redis 即启动失败（左移暴露）。
 	var clu *cluster.Manager
 	if cfg.Cluster.Enabled {
@@ -171,6 +187,11 @@ func run(configPath string) error {
 		// 后端增删广播：订阅方只改内存态，持久化由发起实例完成。
 		go clu.RunBackendSubscriber(ctx, func(action string, bc config.BackendConfig, models []string) error {
 			if action == cluster.BackendDelete {
+				// M14：后端摘除广播同步清除其共享会话绑定（Redis+本地），
+				// 避免指向已摘除后端的死绑定被 Lookup 滑动续期。
+				if sessStore != nil {
+					sessStore.InvalidateBackend(bc.ID)
+				}
 				return reg.RemoveBackend(bc.ID)
 			}
 			_, err := reg.UpsertBackend(bc, models)
@@ -198,10 +219,11 @@ func run(configPath string) error {
 		sess = session.NewStore(cfg.Session.TTL.D(), cfg.Session.MaxEntries)
 		if clu != nil && cfg.Cluster.SessionMode == "shared" {
 			// 集群共享绑定表：会话跨网关实例仍粘到同一后端。
-			px.SetSessionStore(clu.NewSessionStore(sess))
+			sessStore = clu.NewSessionStore(sess)
 		} else {
-			px.SetSessionStore(sess)
+			sessStore = sess
 		}
+		px.SetSessionStore(sessStore)
 	}
 	var capQueue *queue.Queue
 	if cfg.Queue.Enabled {
@@ -222,13 +244,53 @@ func run(configPath string) error {
 	srv := server.New(cfg, reg, pol, sched, tree, pdMgr, gw, px)
 	srv.SetCluster(clu)
 	srv.SetStore(st)
+	srv.SetSessionStore(sessStore) // M14：管理面摘除路径同样联动会话绑定清理
+
+	// 管理面时序缓冲：控制台趋势图的数据源。进程内环形缓冲（15s × 1440 ≈ 6h），
+	// 不持久化，长周期时序仍以 Prometheus 为事实来源。
+	hist := metrics.NewHistory(gw, statsSampleInterval, statsSampleCapacity)
+	hist.SetProbe(func() metrics.RuntimeSnapshot {
+		rt := metrics.RuntimeSnapshot{}
+		if enabled, depth, _ := px.QueueStats(); enabled {
+			rt.QueueDepth = depth
+		}
+		now := time.Now()
+		var samples int
+		for _, b := range reg.All() {
+			rt.BackendsTotal++
+			if b.Healthy() && !b.Cordoned() && !b.Ejected(now) {
+				rt.BackendsHealthy++
+			}
+			snap := b.Snapshot()
+			if snap == nil || snap.Err != "" {
+				continue
+			}
+			samples++
+			rt.KVUsage += snap.KVUsage
+			rt.HitRate += snap.HitRate
+			rt.GenTokPerSec += snap.GenTokPerSec
+		}
+		if samples > 0 {
+			rt.KVUsage /= float64(samples)
+			rt.HitRate /= float64(samples)
+		}
+		if tree != nil {
+			st := tree.Size()
+			rt.KVBytes, rt.KVNodes = st.Bytes, st.Nodes
+		}
+		return rt
+	})
+	go hist.Run(ctx)
+	srv.SetStats(hist)
 
 	// 后台循环。健康翻转回调：下线解绑粘性会话（该后端 KV cache 已失效），
 	// 恢复时唤醒排队请求（容量回来了）。
+	// M14：解绑打通到共享层——sessStore 在集群共享模式下是 cluster.SessionStore，
+	// InvalidateBackend 同时清除 Redis 共享绑定；本地模式退化为仅清本地表。
 	health := backend.NewHealthChecker(reg.All, cfg.Metrics.HealthInterval.D(), cfg.Metrics.HealthTimeout.D(),
 		func(b *backend.Backend, healthy bool) {
-			if !healthy && sess != nil {
-				sess.InvalidateBackend(b.ID)
+			if !healthy && sessStore != nil {
+				sessStore.InvalidateBackend(b.ID)
 			}
 			if healthy && capQueue != nil {
 				capQueue.Signal()
@@ -262,6 +324,8 @@ func run(configPath string) error {
 		notifier = alerting.NewNotifier(cfg.Alerting.Webhooks, func(target, outcome string) {
 			gw.WebhookSent.WithLabelValues(target, outcome).Inc()
 		})
+		// M13：leader 翻转/重启后的重复 firing 通知去重。
+		notifier.SetDedupeWindow(cfg.Alerting.DedupeFiringWindow.D())
 		go notifier.Run(ctx)
 	}
 	if cfg.Alerting.Enabled || cfg.Autoscale.Enabled {
@@ -297,7 +361,8 @@ func run(configPath string) error {
 		srv.SetAlerting(alertEng, scaler)
 	}
 
-	// 金丝雀自动升降级：权重是每实例内存态，各实例独立执行同一份发布配置；
+	// 金丝雀自动升降级：M11 前权重是每实例内存态、各实例独立执行（无流量实例
+	// 卡死、权重分叉）；集群模式下改为 leader 单主评估 + 广播步进，跟随者只应用。
 	// webhook 事件经 leader 门控去重。判据编译失败即启动失败（左移暴露）。
 	if len(cfg.Rollouts) > 0 {
 		var gate func() bool
@@ -307,6 +372,15 @@ func run(configPath string) error {
 		ro, err := rollout.New(cfg.Rollouts, reg, notifier, gate)
 		if err != nil {
 			return err
+		}
+		if clu != nil {
+			// leader 单主评估；步进广播给全部跟随者（订阅方忽略自身 origin）。
+			ro.SetCluster(clu.IsLeader, func(ictx context.Context, ev rollout.StepEvent) error {
+				return clu.PublishRolloutStep(ictx, ev)
+			})
+			go clu.RunRolloutSubscriber(ctx, func(ev rollout.StepEvent) error {
+				return ro.ApplyStep(ctx, ev)
+			})
 		}
 		px.SetResultObserver(ro)
 		srv.SetRollouts(ro)

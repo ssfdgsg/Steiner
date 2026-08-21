@@ -43,6 +43,9 @@ type Autoscaler struct {
 	last     map[string]Recommendation // 最近一次建议，键为模型名
 	lastUp   map[string]time.Time      // 各模型上次扩容建议时间（冷却用）
 	lastDown map[string]time.Time
+	// produced 最近产出过非 hold 建议的模型集合：失去 leader 时用于
+	// 逐个回调 onDesired(model, 0) 归零指标，防止 HPA 按陈旧建议扩容。
+	produced map[string]struct{}
 
 	// onDesired 指标回调：模型 -> 期望副本数，可为 nil。
 	onDesired func(model string, desired float64)
@@ -62,7 +65,8 @@ func NewAutoscaler(cfg config.AutoscaleConfig, reg *backend.Registry, notifier *
 	onDesired func(model string, desired float64)) (*Autoscaler, error) {
 	a := &Autoscaler{
 		cfg: cfg, reg: reg, notifier: notifier,
-		last: map[string]Recommendation{}, lastUp: map[string]time.Time{}, lastDown: map[string]time.Time{},
+		last: map[string]Recommendation{}, lastUp: map[string]time.Time{},
+		lastDown: map[string]time.Time{}, produced: map[string]struct{}{},
 		onDesired: onDesired,
 	}
 	for _, pc := range cfg.Policies {
@@ -96,10 +100,32 @@ func (a *Autoscaler) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if a.gate != nil && !a.gate() {
+				// 失去生产建议资格（非 leader）：把先前产出过建议的模型
+				// 逐个回调 onDesired(model, 0) 归零，防止 HPA 按陈旧建议扩容。
+				a.zeroStaleDesired()
 				continue
 			}
 			a.Evaluate(time.Now())
 		}
+	}
+}
+
+// zeroStaleDesired 失去 leader 时归零各模型建议指标（幂等）：
+// 只影响最近产出过建议的模型，且归零后清空该集合，避免重复回调。
+func (a *Autoscaler) zeroStaleDesired() {
+	a.mu.Lock()
+	models := make([]string, 0, len(a.produced))
+	for m := range a.produced {
+		models = append(models, m)
+	}
+	clear(a.produced)
+	a.mu.Unlock()
+	if a.onDesired == nil {
+		return
+	}
+	for _, m := range models {
+		slog.Info("失去 leader，清空扩缩容建议指标", "model", m)
+		a.onDesired(m, 0)
 	}
 }
 
@@ -160,6 +186,9 @@ func (a *Autoscaler) evalPolicy(p *scalePolicy, now time.Time) {
 
 	a.mu.Lock()
 	a.last[p.cfg.Model] = rec
+	if rec.Direction != "hold" {
+		a.produced[p.cfg.Model] = struct{}{}
+	}
 	shouldNotify := false
 	if rec.Direction == "up" && now.Sub(a.lastUp[p.cfg.Model]) >= p.cfg.ScaleUpCooldown.D() {
 		a.lastUp[p.cfg.Model] = now
@@ -171,11 +200,14 @@ func (a *Autoscaler) evalPolicy(p *scalePolicy, now time.Time) {
 	}
 	a.mu.Unlock()
 
-	if a.onDesired != nil {
-		a.onDesired(p.cfg.Model, float64(rec.DesiredReplicas))
-	}
+	// M3: onDesired 指标回调与通知同一门控——冷却未通过就不产出建议、
+	// 不更新 gateway_autoscale_desired_replicas 指标，保证指标与 webhook 一致
+	// （冷却期只更新 admin 视图 a.last，见上方锁定区间）。
 	if !shouldNotify {
 		return
+	}
+	if a.onDesired != nil {
+		a.onDesired(p.cfg.Model, float64(rec.DesiredReplicas))
 	}
 	slog.Info("产出扩缩容建议", "model", rec.Model, "direction", rec.Direction,
 		"current", rec.CurrentReplicas, "desired", rec.DesiredReplicas)

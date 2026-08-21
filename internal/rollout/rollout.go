@@ -8,9 +8,11 @@
 // 子池滑动窗口（按发布阶段分窗，晋级/回滚后重置），金丝雀池与稳定池
 // （其余子池聚合）各一份，表达式对比两者的错误率与时延分布。
 //
-// 权重变更仅作用于本实例内存态（Split.SetWeight 原子写）；多实例部署时
-// 各实例独立执行同一份发布配置，以各自观测流量判据，步调最终一致；
-// webhook 事件经 notifyGate（集群 leader 判定）去重，避免重复通知。
+// 权重变更仅作用于本实例内存态（Split.SetWeight 原子写）。多实例部署时各
+// 实例原本以各自观测流量独立执行判据、自行晋级——无流量实例永不晋级、
+// 且各实例权重步调分叉（M11）。修复：集群模式下由 leader 单主评估并广播
+// 发布状态变更（StepEvent），跟随者只应用广播、不自行推进；webhook 事件经
+// notifyGate（leader 判定）去重，避免重复通知。
 package rollout
 
 import (
@@ -40,6 +42,14 @@ const (
 
 // ttftSampleCap 每窗口 TTFT 样本上限（环形覆盖），p95 由样本排序估算。
 const ttftSampleCap = 512
+
+// StepEvent 发布状态变更事件。集群模式下由 leader 单主评估产生、经集群广播
+// 分发；各实例（含 follower）收到后按同一事件重建状态与权重（M11）。
+type StepEvent struct {
+	Model   string `json:"model"`
+	State   string `json:"state"`
+	StepIdx int    `json:"step_idx"`
+}
 
 // window 单个子池在当前发布阶段内的观测窗口。
 type window struct {
@@ -128,6 +138,67 @@ type Manager struct {
 
 	notifier   *alerting.Notifier // 可为 nil（未配置 webhook）
 	notifyGate func() bool        // 可为 nil；集群模式传 leader 判定去重通知
+
+	// 集群模式（M11）：leaderGate 判定本实例是否评估主（nil=单机按 leader）；
+	// publish 供 leader 广播发布状态变更（nil=单机不广播）。
+	leaderGate func() bool
+	publish    func(context.Context, StepEvent) error
+}
+
+// SetCluster 装配集群模式：leaderGate 判定本实例是否执行评估推进，publish 供
+// leader 广播发布状态变更。两者可同时为 nil（单机部署，保持本地自评估语义）。
+// 由 main 装配期调用；测试可用 fake 注入。
+func (m *Manager) SetCluster(leaderGate func() bool, publish func(context.Context, StepEvent) error) {
+	m.leaderGate = leaderGate
+	m.publish = publish
+}
+
+// ApplyStep 应用一条发布状态变更（集群广播接收端）：按事件重建状态、步进与
+// 子池权重，保证多实例收敛到同一发布进度（M11 跟随者路径）。
+func (m *Manager) ApplyStep(_ context.Context, ev StepEvent) error {
+	r, ok := m.byModel[ev.Model]
+	if !ok {
+		return fmt.Errorf("模型 %s 未配置金丝雀发布", ev.Model)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch ev.State {
+	case StateRunning:
+		idx := ev.StepIdx
+		if idx < 0 || idx >= len(r.cfg.Steps) {
+			return fmt.Errorf("模型 %s 的步进 %d 越界", ev.Model, idx)
+		}
+		r.state = StateRunning
+		r.stepIdx = idx
+		r.stepStart = time.Now() // 跟随者以接收时刻起算观察窗（leader 时钟不共享）
+		r.canaryWin.reset()
+		r.stableWin.reset()
+		r.applyWeights(r.cfg.Steps[idx])
+	case StateCompleted:
+		r.state = StateCompleted
+		r.applyWeights(r.cfg.Steps[len(r.cfg.Steps)-1]) // 末阶约定为 100（L7）
+	case StateFailed:
+		r.state = StateFailed
+		r.applyWeights(0)
+	case StateIdle:
+		r.state = StateIdle
+	default:
+		return fmt.Errorf("模型 %s 收到未知发布状态 %q", ev.Model, ev.State)
+	}
+	r.stepIdx = ev.StepIdx
+	slog.Info("应用集群发布状态", "model", ev.Model, "state", ev.State, "step", ev.StepIdx)
+	return nil
+}
+
+// broadcast 评估主在状态变更后向集群广播（失败仅记日志：收敛由下一次事件
+// 驱动，最终一致）。
+func (m *Manager) broadcast(r *Rollout, state string, stepIdx int) {
+	if m.publish == nil {
+		return
+	}
+	if err := m.publish(context.Background(), StepEvent{Model: r.cfg.Model, State: state, StepIdx: stepIdx}); err != nil {
+		slog.Error("发布状态广播失败", "model", r.cfg.Model, "state", state, "err", err)
+	}
 }
 
 // New 构造管理器：编译判据、解析子池、构建观测索引；auto_start 的发布立即
@@ -218,6 +289,10 @@ func (m *Manager) Tick(now time.Time) {
 }
 
 func (m *Manager) tickOne(r *Rollout, now time.Time) {
+	// M11：集群模式下仅 leader 自行评估推进；跟随者状态由广播（ApplyStep）驱动。
+	if m.leaderGate != nil && !m.leaderGate() {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.state != StateRunning {
@@ -232,6 +307,7 @@ func (m *Manager) tickOne(r *Rollout, now time.Time) {
 		slog.Warn("金丝雀回滚", "model", r.cfg.Model, "step", r.stepIdx, "weight", r.cfg.Steps[r.stepIdx])
 		m.notify(r, "rolled_back",
 			fmt.Sprintf("模型 %s 金丝雀在 %.0f%% 档命中回滚判据，权重已清零", r.cfg.Model, r.cfg.Steps[r.stepIdx]), env)
+		m.broadcast(r, StateFailed, r.stepIdx)
 		return
 	}
 	// 晋级判据：观察期满后每轮尝试，直到命中或回滚。
@@ -247,6 +323,7 @@ func (m *Manager) tickOne(r *Rollout, now time.Time) {
 		slog.Info("金丝雀发布完成", "model", r.cfg.Model)
 		m.notify(r, "completed", fmt.Sprintf("模型 %s 金丝雀发布完成（%.0f%%）",
 			r.cfg.Model, r.cfg.Steps[len(r.cfg.Steps)-1]), env)
+		m.broadcast(r, StateCompleted, len(r.cfg.Steps)-1) // 末阶索引（AppendStep 用）
 		return
 	}
 	prev := r.cfg.Steps[r.stepIdx-1]
@@ -257,6 +334,7 @@ func (m *Manager) tickOne(r *Rollout, now time.Time) {
 	r.stableWin.reset()
 	slog.Info("金丝雀晋级", "model", r.cfg.Model, "from", prev, "to", next)
 	m.notify(r, "promoted", fmt.Sprintf("模型 %s 金丝雀权重 %.0f%% → %.0f%%", r.cfg.Model, prev, next), env)
+	m.broadcast(r, StateRunning, r.stepIdx)
 }
 
 // start 从第一阶开始放量（New 的 auto_start 与 admin Reset 共用）。
@@ -272,6 +350,7 @@ func (m *Manager) start(r *Rollout, now time.Time) {
 	r.mu.Unlock()
 	slog.Info("金丝雀发布启动", "model", r.cfg.Model, "weight", r.cfg.Steps[0])
 	m.notify(r, "started", fmt.Sprintf("模型 %s 金丝雀发布启动，首阶权重 %.0f%%", r.cfg.Model, r.cfg.Steps[0]), env)
+	m.broadcast(r, StateRunning, 0)
 }
 
 // Reset 重新从第一阶开始（failed/completed/idle/running 任意状态均可触发）。

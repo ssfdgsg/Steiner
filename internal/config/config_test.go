@@ -20,6 +20,8 @@ func writeTemp(t *testing.T, content string) string {
 }
 
 const minimalYAML = `
+server:
+  admin_token: test-token
 backends:
   - id: b1
     engine: vllm
@@ -34,8 +36,11 @@ func TestLoadMinimalAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("加载失败: %v", err)
 	}
-	if cfg.Server.Listen != ":8080" {
-		t.Fatalf("默认监听地址不符: %s", cfg.Server.Listen)
+	if cfg.Server.Listen != "127.0.0.1:8080" {
+		t.Fatalf("默认监听地址不符（应仅本机回环）: %s", cfg.Server.Listen)
+	}
+	if cfg.Server.AdminToken != "test-token" {
+		t.Fatalf("admin_token 加载失败: %q", cfg.Server.AdminToken)
 	}
 	if cfg.Server.Retries != 2 {
 		t.Fatalf("默认重试次数不符: %d", cfg.Server.Retries)
@@ -60,9 +65,17 @@ func TestLoadMinimalAndDefaults(t *testing.T) {
 }
 
 func TestDurationFormats(t *testing.T) {
-	cfg, err := Load(writeTemp(t, minimalYAML+`
+	cfg, err := Load(writeTemp(t, `
 server:
+  admin_token: test-token
   upstream_connect_timeout: 1500ms
+backends:
+  - id: b1
+    engine: vllm
+    url: http://127.0.0.1:8001
+models:
+  - name: m1
+    backends: [b1]
 metrics:
   scrape_interval: 3
 `))
@@ -91,6 +104,8 @@ func mustFail(t *testing.T, yaml, keyword string) {
 
 func TestValidateDuplicateBackend(t *testing.T) {
 	mustFail(t, `
+server:
+  admin_token: t
 backends:
   - { id: b1, engine: vllm, url: "http://x:1" }
   - { id: b1, engine: vllm, url: "http://x:2" }
@@ -101,6 +116,8 @@ models:
 
 func TestValidateBadEngine(t *testing.T) {
 	mustFail(t, `
+server:
+  admin_token: t
 backends:
   - { id: b1, engine: tgi, url: "http://x:1" }
 models:
@@ -110,6 +127,8 @@ models:
 
 func TestValidateMissingBackendRef(t *testing.T) {
 	mustFail(t, `
+server:
+  admin_token: t
 backends:
   - { id: b1, engine: vllm, url: "http://x:1" }
 models:
@@ -119,6 +138,8 @@ models:
 
 func TestValidateMissingPolicyRef(t *testing.T) {
 	mustFail(t, `
+server:
+  admin_token: t
 backends:
   - { id: b1, engine: vllm, url: "http://x:1" }
 models:
@@ -128,6 +149,8 @@ models:
 
 func TestValidatePDGroupRefs(t *testing.T) {
 	mustFail(t, `
+server:
+  admin_token: t
 backends:
   - { id: b1, engine: vllm, url: "http://x:1" }
 pd_groups:
@@ -139,6 +162,8 @@ models:
 
 func TestValidatePDLinkOutsideGroup(t *testing.T) {
 	mustFail(t, `
+server:
+  admin_token: t
 backends:
   - { id: p1, engine: vllm, url: "http://x:1" }
   - { id: d1, engine: vllm, url: "http://x:2" }
@@ -156,6 +181,8 @@ models:
 
 func TestValidateBackendsAndPDGroupExclusive(t *testing.T) {
 	mustFail(t, `
+server:
+  admin_token: t
 backends:
   - { id: b1, engine: vllm, url: "http://x:1" }
 pd_groups:
@@ -167,6 +194,8 @@ models:
 
 func TestValidateNoModels(t *testing.T) {
 	mustFail(t, `
+server:
+  admin_token: t
 backends:
   - { id: b1, engine: vllm, url: "http://x:1" }
 `, "模型路由")
@@ -208,4 +237,49 @@ policies:
     preset: balanced
     score: "running * 1.0"
 `, "二选一")
+}
+
+// TestValidateMissingAdminToken C1 修复断言：未配置 server.admin_token 时拒绝启动。
+func TestValidateMissingAdminToken(t *testing.T) {
+	mustFail(t, `
+backends:
+  - { id: b1, engine: vllm, url: "http://x:1" }
+models:
+  - { name: m1, backends: [b1] }
+`, "admin_token")
+}
+
+// TestClusterRateLimitFailOpenDefault H11 新字段缺省：未显式配置时
+// ApplyDefaults 填充 true（Redis 故障退本地桶，可用性优先）。
+func TestClusterRateLimitFailOpenDefault(t *testing.T) {
+	cfg, err := Load(writeTemp(t, minimalYAML+`
+cluster:
+  enabled: true
+  redis_addr: 127.0.0.1:6379
+  rate_limit_mode: distributed
+`))
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	if cfg.Cluster.RateLimitFailOpen == nil || !*cfg.Cluster.RateLimitFailOpen {
+		t.Fatalf("RateLimitFailOpen 缺省应为 true，实际 %v", cfg.Cluster.RateLimitFailOpen)
+	}
+}
+
+// TestClusterRateLimitFailOpenExplicitFalse H11 显式 false 应被保留
+// （严格限额：Redis 故障直接拒绝），不被默认值覆盖。
+func TestClusterRateLimitFailOpenExplicitFalse(t *testing.T) {
+	cfg, err := Load(writeTemp(t, minimalYAML+`
+cluster:
+  enabled: true
+  redis_addr: 127.0.0.1:6379
+  rate_limit_mode: distributed
+  rate_limit_fail_open: false
+`))
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	if cfg.Cluster.RateLimitFailOpen == nil || *cfg.Cluster.RateLimitFailOpen {
+		t.Fatal("显式 rate_limit_fail_open: false 应被保留，不得被默认 true 覆盖")
+	}
 }

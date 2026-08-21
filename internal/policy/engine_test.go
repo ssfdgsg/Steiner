@@ -4,6 +4,7 @@ package policy
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // baseEnv 构造一个包含全部常用变量的求值环境。
@@ -23,6 +24,36 @@ func baseEnv(over map[string]interface{}) map[string]interface{} {
 		env[k] = v
 	}
 	return env
+}
+
+func TestRunWithTimeoutTimesOut(t *testing.T) {
+	prog, err := compile("1 > 0", true)
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+	// 1ns 远小于解释器启动与求值开销（百纳秒以上量级），超时必先于结果到达，
+	// 由此确定性触发超时错误，而非碰运气。
+	_, err = RunWithTimeout(prog, baseEnv(nil), time.Nanosecond)
+	if err == nil {
+		t.Fatal("1ns 超时下应返回超时错误")
+	}
+	if !strings.Contains(err.Error(), "表达式求值超时") {
+		t.Fatalf("超时错误文案不符: %v", err)
+	}
+}
+
+func TestRunWithTimeoutSucceeds(t *testing.T) {
+	prog, err := compile("1 > 0", true)
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+	val, err := RunWithTimeout(prog, baseEnv(nil), 5*time.Second)
+	if err != nil {
+		t.Fatalf("5s 超时下简单表达式应正常返回: %v", err)
+	}
+	if val != true {
+		t.Fatalf("期望 true，实际 %v", val)
+	}
 }
 
 func TestSetAndEval(t *testing.T) {
@@ -123,6 +154,23 @@ func TestMissingScore(t *testing.T) {
 	e := NewEngine()
 	if err := e.Set("p", "healthy", ""); err == nil || !strings.Contains(err.Error(), "score") {
 		t.Fatalf("缺少 score 应报错，实际: %v", err)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	filter, errs := Validate("", "running * 2.0 - prefix_match * 10.0")
+	if filter != "healthy" || errs == nil || len(errs) != 0 {
+		t.Fatalf("空 filter 应归一化且合法，并返回非 nil 空错误切片: filter=%q errs=%+v", filter, errs)
+	}
+
+	_, errs = Validate("healthy &&", "waiting *")
+	if len(errs) != 2 || errs[0].Field != "filter" || errs[1].Field != "score" {
+		t.Fatalf("应分别返回 filter/score 编译错误: %+v", errs)
+	}
+
+	_, errs = Validate("healthy", "")
+	if len(errs) != 1 || errs[0].Field != "score" || !strings.Contains(errs[0].Message, "缺少") {
+		t.Fatalf("缺少 score 应返回字段错误: %+v", errs)
 	}
 }
 

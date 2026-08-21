@@ -49,6 +49,7 @@ type Group struct {
 
 	linksByPrefill map[string][]*Link
 	decodeByID     map[string]*backend.Backend
+	prefillByID    map[string]*backend.Backend
 	rr             atomic.Uint64
 }
 
@@ -67,9 +68,11 @@ func NewManager(cfg *config.Config, reg *backend.Registry) (*Manager, error) {
 			PolicyName:     gc.Policy,
 			linksByPrefill: map[string][]*Link{},
 			decodeByID:     map[string]*backend.Backend{},
+			prefillByID:    map[string]*backend.Backend{},
 		}
 		for _, id := range gc.Prefill {
 			g.Prefill = append(g.Prefill, reg.Get(id))
+			g.prefillByID[id] = reg.Get(id)
 		}
 		for _, id := range gc.Decode {
 			d := reg.Get(id)
@@ -105,12 +108,46 @@ func (m *Manager) Groups() map[string]*Group { return m.groups }
 // decode 侧只在与所选 prefill 连通的实例里选，打分 = decode 综合负载 + 链路拥塞度。
 // excludeDecode 为本次请求已失败过的 decode 集合（servePD 按故障侧排除重试）。
 func (g *Group) Pick(s *scheduler.Scheduler, req *scheduler.Request, excludePrefill, excludeDecode map[string]bool) (*backend.Backend, *backend.Backend, *Link, error) {
-	prefill, err := s.PickAmong(g.Prefill, g.Strategy, g.PolicyName, req, excludePrefill, &g.rr)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("PD 组 %s prefill 选路失败: %w", g.Name, err)
+	return g.PickPreferred(s, req, "", excludePrefill, excludeDecode)
+}
+
+// PrefillAvailable 判断 prefill 实例是否在组内且当前可用（会话粘性候选判定，H9）。
+func (g *Group) PrefillAvailable(id string) bool {
+	p := g.prefillByID[id]
+	return p != nil && p.Available(time.Now())
+}
+
+// PickPreferred 会话粘性版 Pick：preferPrefill 非空时优先选择该 prefill 实例
+// （须组内成员、未被排除、且通过调度器单候选选路——策略/表达式同样生效），
+// 失败自动回退普通选路。H9：PD 会话粘性绑定 prefill 侧（KV 亲和：同样的提示词
+// 前缀应再次命中已持有其 KV cache 的实例）。
+func (g *Group) PickPreferred(s *scheduler.Scheduler, req *scheduler.Request, preferPrefill string, excludePrefill, excludeDecode map[string]bool) (*backend.Backend, *backend.Backend, *Link, error) {
+	now := time.Now()
+	var prefill *backend.Backend
+	if preferPrefill != "" && (excludePrefill == nil || !excludePrefill[preferPrefill]) {
+		if p := g.prefillByID[preferPrefill]; p != nil && p.Available(now) {
+			if b, err := s.PickAmong([]*backend.Backend{p}, g.Strategy, g.PolicyName, req, excludePrefill, &g.rr); err == nil && b != nil && b.ID == preferPrefill {
+				prefill = b
+			}
+		}
+	}
+	if prefill == nil {
+		p, err := s.PickAmong(g.Prefill, g.Strategy, g.PolicyName, req, excludePrefill, &g.rr)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("PD 组 %s prefill 选路失败: %w", g.Name, err)
+		}
+		prefill = p
 	}
 
-	now := time.Now()
+	decode, link, err := g.pickDecode(prefill, now, excludeDecode)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return prefill, decode, link, nil
+}
+
+// pickDecode 在选定 prefill 的链路中选最优 decode（负载 + 链路拥塞度）。
+func (g *Group) pickDecode(prefill *backend.Backend, now time.Time, excludeDecode map[string]bool) (*backend.Backend, *Link, error) {
 	links := g.linksByPrefill[prefill.ID]
 	var bestLink *Link
 	var bestDecode *backend.Backend
@@ -134,9 +171,9 @@ func (g *Group) Pick(s *scheduler.Scheduler, req *scheduler.Request, excludePref
 		}
 	}
 	if bestDecode == nil {
-		return nil, nil, nil, fmt.Errorf("PD 组 %s: prefill %s 无可用 decode 链路", g.Name, prefill.ID)
+		return nil, nil, fmt.Errorf("PD 组 %s: prefill %s 无可用 decode 链路", g.Name, prefill.ID)
 	}
-	return prefill, bestDecode, bestLink, nil
+	return bestDecode, bestLink, nil
 }
 
 // LinkState 链路状态视图（admin API / 指标用）。

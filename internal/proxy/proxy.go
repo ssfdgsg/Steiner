@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/expr-lang/expr/vm"
@@ -54,6 +55,10 @@ func (l localLimiter) Allow(context.Context) bool { return l.Limiter.Allow() }
 type SessionStore interface {
 	Lookup(key string) (string, bool)
 	Bind(key, backendID string)
+	// Unbind 解除单个会话的绑定（绑定已失效时清理，本地+共享同步）。
+	Unbind(key string)
+	// InvalidateBackend 后端下线/摘除时批量清除其全部会话绑定。
+	InvalidateBackend(backendID string)
 }
 
 // Handler 代理处理器。
@@ -205,19 +210,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	if r.Body != nil {
 		var err error
-		body, err = io.ReadAll(io.LimitReader(r.Body, h.cfg.Server.MaxBodyBytes+1))
+		var tooLarge bool
+		body, tooLarge, err = readRequestBody(r, h.cfg.Server.MaxBodyBytes)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "读取请求体失败: "+err.Error())
 			return
 		}
-		if int64(len(body)) > h.cfg.Server.MaxBodyBytes {
+		if tooLarge {
 			writeError(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("请求体超过上限 %d 字节", h.cfg.Server.MaxBodyBytes))
 			return
 		}
 	}
 
-	req, doc := parseRequest(r, body)
+	// 先只扫描 model/stream/user/priority 等小字段。对无需 prompt 特征的普通路由，
+	// messages/prompt 大字段不会被解码成第二份字符串或 map 树。
+	req := parseRequestMeta(r, body)
 	route, err := h.reg.Route(req.Model)
 	if err != nil {
 		h.gw.PickErrors.WithLabelValues(req.Model, "no_route").Inc()
@@ -238,6 +246,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 仅在调度策略、KV 前缀树、容量准入、PD 或模型改写真正需要时解码完整文档。
+	// 无 KV 的负载类策略直接复用原始 body 转发，避免额外 prompt 大对象。
+	needFeatures, promptLimit := h.sched.PromptRequirements(route, req.SessionID != "")
+	if h.admission != nil {
+		needFeatures = true
+	}
+	if route.PDGroup != "" {
+		// PD 组策略不挂在 Route 上，保守保留既有完整请求特征语义。
+		needFeatures = true
+		promptLimit = -1
+	}
+	needDocument := needFeatures || route.RewriteModel != "" || route.PDGroup != ""
+	var doc map[string]interface{}
+	if needDocument {
+		doc = parseRequestDocument(body)
+		if doc != nil {
+			populateRequestBase(req, doc)
+			applySessionHeader(r, req)
+			if needFeatures {
+				populatePromptFeatures(req, doc, promptLimit)
+			}
+		}
+	}
+
 	// 模型名改写：对外统一模型名 -> 后端实际部署名。
 	// doc 是 PD 路径的转发载体，body 是常规路径的转发载体，两者都要更新。
 	if route.RewriteModel != "" && doc != nil {
@@ -254,6 +286,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveNormal(w, r, route, req, body)
 }
 
+// readRequestBody 在已知 Content-Length 时一次精确分配，避免 LimitReader 隐藏长度后
+// io.ReadAll 多轮扩容复制大请求；chunked/未知长度仍保留 max+1 的严格上限检查。
+func readRequestBody(r *http.Request, maxBytes int64) (body []byte, tooLarge bool, err error) {
+	if r.ContentLength > maxBytes {
+		return nil, true, nil
+	}
+	if r.ContentLength >= 0 {
+		maxInt := int64(^uint(0) >> 1)
+		if r.ContentLength > maxInt {
+			return nil, true, nil
+		}
+		body = make([]byte, int(r.ContentLength))
+		if len(body) == 0 {
+			return body, false, nil
+		}
+		_, err = io.ReadFull(r.Body, body)
+		return body, false, err
+	}
+	body, err = io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+	if err != nil {
+		return nil, false, err
+	}
+	return body, int64(len(body)) > maxBytes, nil
+}
+
 // serveNormal 常规池转发：会话粘性短路 -> 选路（容量不足可排队）->
 // 转发 -> 失败则换后端重试。
 func (h *Handler) serveNormal(w http.ResponseWriter, r *http.Request, route *backend.Route, req *scheduler.Request, body []byte) {
@@ -262,11 +319,16 @@ func (h *Handler) serveNormal(w http.ResponseWriter, r *http.Request, route *bac
 	var lastErr error
 
 	// 会话粘性：绑定的后端仍可用则首选；转发失败后回落正常选路并改绑。
+	// L2：绑定指向已摘除（不在路由池）或不可用（健康摘除/冷却/隔离）的后端
+	// 即视为失效——立即 Unbind 清理，避免死绑定被后续 Lookup 反复滑动续期、
+	// 占满表容量淘汰活跃会话；清理后照常回落选路，路由正确性不受影响。
 	var preferred *backend.Backend
 	if h.sess != nil && req.SessionID != "" {
 		if id, ok := h.sess.Lookup(req.SessionID); ok {
 			if b := routeBackend(route, id); b != nil && b.Available(time.Now()) {
 				preferred = b
+			} else {
+				h.sess.Unbind(req.SessionID)
 			}
 		}
 	}
@@ -416,18 +478,41 @@ func (h *Handler) tryForward(w http.ResponseWriter, r *http.Request, b *backend.
 			attribute.String("server.address", b.URL.Host),
 		))
 	defer fspan.End()
+
+	// H2：非流式请求的响应体读取套"预算型"期限（预算 = UpstreamResponseTimeout
+	// 剩余时间，下限 30s）。ctx 到期后 transport 关闭上游连接，打断挂起的 body
+	// 读取；流式（SSE 长流）不受限，仍由客户端连接生命周期控制。
+	if !req.Stream {
+		bctx, cancel := context.WithTimeout(fctx,
+			nonStreamBodyBudget(h.cfg.Server.UpstreamResponseTimeout.D(), time.Since(start)))
+		defer cancel()
+		fctx = bctx
+	}
 	resp, err := h.doUpstream(fctx, r, b, r.URL.Path, r.URL.RawQuery, body)
 	if err != nil {
+		// H12：上游错误若源于 ctx 取消（客户端已断开），后端无辜——不 MarkFailure、
+		// 不换后端重试（避免重试风暴与误熔断），直接以 503 中止并向客户端返回，
+		// Info 日志与真实连接失败区分；真实连接失败（connect/超时等）才记账重试。
+		if errors.Is(err, context.Canceled) {
+			fspan.RecordError(err)
+			fspan.SetStatus(otelcodes.Error, "client_disconnect")
+			slog.Info("客户端断开，中止转发（不记账、不重试）", "backend", b.ID, "model", model, "err", err)
+			writeError(w, http.StatusServiceUnavailable, "客户端已断开，转发中止")
+			h.gw.ReqTotal.WithLabelValues(b.ID, model, strconv.Itoa(http.StatusServiceUnavailable)).Inc()
+			return true, err
+		}
 		h.gw.UpstreamErrors.WithLabelValues(b.ID, "connect").Inc()
 		fspan.RecordError(err)
 		fspan.SetStatus(otelcodes.Error, "connect")
 		b.MarkFailure(int32(h.cfg.Server.FailureThreshold), h.cfg.Server.EjectCooldown.D())
 		return false, err
 	}
-	// 网关类错误码视为后端不可用，可换后端重试；4xx 是请求本身的问题，原样透传。
+	// 网关类错误码（502/503/504）与引擎过载（429）视为后端不可用，可换后端重试；
+	// 其余 4xx 是请求本身的问题，原样透传不重试。
 	if resp.StatusCode == http.StatusBadGateway ||
 		resp.StatusCode == http.StatusServiceUnavailable ||
-		resp.StatusCode == http.StatusGatewayTimeout {
+		resp.StatusCode == http.StatusGatewayTimeout ||
+		resp.StatusCode == http.StatusTooManyRequests {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		h.gw.UpstreamErrors.WithLabelValues(b.ID, "bad_status").Inc()
@@ -439,17 +524,22 @@ func (h *Handler) tryForward(w http.ResponseWriter, r *http.Request, b *backend.
 
 	code := h.streamResponse(fctx, w, resp, b.ID, model, start)
 	fspan.SetAttributes(attribute.Int("http.response.status_code", code))
-	if code < http.StatusInternalServerError {
+	// M4 语义：只有 2xx/3xx（<400）算转发成功 → MarkSuccess + 前缀归属 + 会话绑定；
+	// 400~499（非 429）是客户端错误，透传但不记账、不粘会话、不观测；
+	// 429/5xx 走失败路径（429 已在流式前拦截重试，此处可达的是已写出首字节的情形）。
+	if code < http.StatusBadRequest {
 		b.MarkSuccess()
 		h.sched.Observe(req, b.ID)
 		// 会话粘性：成功应答后（重新）绑定会话到本后端。
 		if h.sess != nil && req.SessionID != "" {
 			h.sess.Bind(req.SessionID, b.ID)
 		}
+		h.observeResult(b.ID, code)
+	} else if code >= http.StatusInternalServerError {
+		h.observeResult(b.ID, code)
 	}
 	h.gw.ReqTotal.WithLabelValues(b.ID, model, strconv.Itoa(code)).Inc()
 	h.gw.ReqDuration.WithLabelValues(b.ID, model).Observe(time.Since(start).Seconds())
-	h.observeResult(b.ID, code)
 	return true, nil
 }
 
@@ -484,12 +574,22 @@ func (h *Handler) streamResponse(ctx context.Context, w http.ResponseWriter, res
 	w.Header().Set("X-Upstream-Backend", backendID)
 	w.WriteHeader(resp.StatusCode)
 
+	// H2：非流式响应（非 SSE）在响应头到达后套"预算型"读取——读取循环经
+	// deadlineReader 在预算到期时以超时错误退出，不再无限挂起；
+	// SSE 长流保持不受限（由客户端连接生命周期控制）。
+	body := io.Reader(resp.Body)
+	if !isSSEResponse(resp) {
+		if dl, ok := ctx.Deadline(); ok {
+			body = &deadlineReader{rc: resp.Body, deadline: dl}
+		}
+	}
+
 	rc := http.NewResponseController(w)
 	buf := make([]byte, 32*1024)
 	first := true
 	var tail tailBuffer
 	for {
-		n, err := resp.Body.Read(buf)
+		n, err := body.Read(buf)
 		if n > 0 {
 			if first {
 				ttft := time.Since(start).Seconds()
@@ -513,8 +613,12 @@ func (h *Handler) streamResponse(ctx context.Context, w http.ResponseWriter, res
 			_ = rc.Flush()
 		}
 		if err != nil {
+			timedOut := errors.Is(err, errBodyReadTimeout) || errors.Is(err, context.DeadlineExceeded)
 			if !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
 				h.gw.UpstreamErrors.WithLabelValues(backendID, "stream").Inc()
+				if timedOut {
+					span.AddEvent("body_read_timeout")
+				}
 				span.AddEvent("stream_interrupt")
 				span.RecordError(err)
 				slog.Debug("上游响应流中断", "backend", backendID, "err", err)
@@ -593,4 +697,51 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(openai.ErrorResponse{
 		Error: openai.ErrorBody{Message: msg, Type: "gateway_error", Code: code},
 	})
+}
+
+// errBodyReadTimeout 非流式响应体读取超出预算期限。
+var errBodyReadTimeout = errors.New("上游响应体读取超时(超出预算)")
+
+// deadlineReader 预算型读取包装：每次 Read 先检查期限，到期直接返回
+// errBodyReadTimeout；底层读取返回后若已跨过期限（且非正常 EOF），也翻译为
+// 超时错误。真正的连接中断由请求 ctx 截止期驱动（transport 在到期时关闭上游
+// 连接，打断挂起的 Read），本包装负责把"到期"变成调用方可识别的超时错误。
+type deadlineReader struct {
+	rc       io.Reader
+	deadline time.Time
+}
+
+func (d *deadlineReader) Read(p []byte) (int, error) {
+	if time.Now().After(d.deadline) {
+		return 0, errBodyReadTimeout
+	}
+	n, err := d.rc.Read(p)
+	if n > 0 {
+		return n, err // 数据优先交付，超时从下一次 Read 开始生效
+	}
+	if errors.Is(err, io.EOF) {
+		return 0, err // 正常结束，即使略超期限也不误报超时
+	}
+	if err == nil {
+		return 0, nil
+	}
+	if time.Now().After(d.deadline) {
+		return 0, errBodyReadTimeout
+	}
+	return n, err
+}
+
+// nonStreamBodyBudget 非流式响应体的读取预算：UpstreamResponseTimeout 的剩余时间，
+// 下限 30s（防止过小的配置误杀正常较长的非流式生成）。
+func nonStreamBodyBudget(timeout, elapsed time.Duration) time.Duration {
+	b := timeout - elapsed
+	if b < 30*time.Second {
+		b = 30 * time.Second
+	}
+	return b
+}
+
+// isSSEResponse 判断上游响应是否为 SSE 流（长流不套读超时）。
+func isSSEResponse(resp *http.Response) bool {
+	return strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 }

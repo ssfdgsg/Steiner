@@ -26,3 +26,11 @@
 ## 约定
 - 时长字段支持 Go duration 字符串（`500ms`、`2s`）或纯数字（按秒解释）；
 - 策略表达式运行期可经 `PUT /admin/policies/{name}` 热更新，其余配置段重启生效。
+
+## 安全（C1/H1 修复后）
+- `server.admin_token` **必填**：管理面 `/admin/*` 全部要求
+  `Authorization: Bearer <token>`，未配置时网关拒绝启动；
+- 默认监听收紧为 `127.0.0.1:8080`（仅本机回环），对外暴露需显式配置
+  `listen: "0.0.0.0:8080"`；
+- 管理面变更类请求（POST/PUT/PATCH/DELETE）强制 `Content-Type: application/json`，
+  非 JSON 一律 415（切断跨站表单投递的 CSRF 前置）。

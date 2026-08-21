@@ -33,9 +33,10 @@ func TestPresetsList(t *testing.T) {
 			t.Fatalf("预设 %s 展示字段缺失", p.Name)
 		}
 	}
-	// 默认策略与内置 balanced 表达式一致，应反查为 balanced。
-	if got := out.Policies["default"]["preset"]; got != "balanced" {
-		t.Fatalf("默认策略应反查为 balanced，实际 %q", got)
+	// L3：默认策略是内置表达式而非显式预设声明（即使与 balanced 逐字相同），
+	// 视图必须显示 custom，不得反查误标为 balanced。
+	if got := out.Policies["default"]["preset"]; got != "custom" {
+		t.Fatalf("默认策略无显式预设应显示 custom，实际 %q", got)
 	}
 }
 

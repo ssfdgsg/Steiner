@@ -36,6 +36,8 @@ func TestDynamicBackendAddRemove(t *testing.T) {
 
 	payload := `{"id":"b3","url":"` + srv3.URL + `","engine":"vllm","models":["m1"]}`
 	req := httptest.NewRequest("POST", "/admin/backends", strings.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer it-token")
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	g1.handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -53,6 +55,7 @@ func TestDynamicBackendAddRemove(t *testing.T) {
 
 	// 摘除后两个实例都不再路由到 b3。
 	req = httptest.NewRequest("DELETE", "/admin/backends/b3", nil)
+	req.Header.Set("Authorization", "Bearer it-token")
 	rec = httptest.NewRecorder()
 	g1.handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -79,6 +82,8 @@ func TestDynamicBackendValidation(t *testing.T) {
 		"重复 ID": {`{"id":"b1","url":"http://127.0.0.1:1","engine":"vllm","models":["m1"]}`, http.StatusConflict},
 	} {
 		req := httptest.NewRequest("POST", "/admin/backends", strings.NewReader(tc.payload))
+		req.Header.Set("Authorization", "Bearer it-token")
+		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		g1.handler.ServeHTTP(rec, req)
 		if rec.Code != tc.want {

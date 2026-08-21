@@ -298,6 +298,44 @@ func TestAutoscaler_扩容建议与冷却(t *testing.T) {
 	}
 }
 
+// TestNotifier_重复目标去重_L8 验证同一 webhook 目标被重复引用时只投递一次
+// （运行时按 URL 身份去重，保持首次出现顺序）：异名同 URL 与同名重复都不重复投递。
+func TestNotifier_重复目标去重_L8(t *testing.T) {
+	col := &collector{}
+	srv := httptest.NewServer(col.handler())
+	defer srv.Close()
+
+	// 配置冗余：w1/w2 指向同一 URL（异名同 URL），另有独立目标 w3。
+	n := NewNotifier([]config.WebhookConfig{
+		webhookCfg("w1", srv.URL, 0),
+		webhookCfg("w2", srv.URL, 0),
+		webhookCfg("w3", srv.URL, 0), // 同 URL 第三个名字，验证多条目去重
+	}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.Run(ctx)
+
+	// 事件同时投递到 w1/w2/w3（三者同 URL）→ 只应送达一次。
+	n.Send(Event{Type: TypeAlert, Status: StatusFiring, Rule: "r1", Instance: "b1"}, []string{"w1", "w2", "w3"})
+	waitFor(t, 2*time.Second, func() bool { return len(col.snapshot()) == 1 }, "同 URL 重复目标应只投递一次")
+	time.Sleep(50 * time.Millisecond)
+	if got := col.snapshot(); len(got) != 1 {
+		t.Fatalf("L8 修复后:同 URL 重复目标只应投递一次,实际 %d 条: %+v", len(got), got)
+	}
+
+	// 同名重复引用（规则列表里同一名字写多次）同样只投递一次。
+	n.Send(Event{Type: TypeAlert, Status: StatusFiring, Rule: "r2", Instance: "b1"}, []string{"w1", "w1"})
+	waitFor(t, 2*time.Second, func() bool { return len(col.snapshot()) == 2 }, "同名重复应只多投递一次")
+	time.Sleep(50 * time.Millisecond)
+	got := col.snapshot()
+	if len(got) != 2 {
+		t.Fatalf("L8 修复后:同名重复只应多投递一次,实际累计 %d 条: %+v", len(got), got)
+	}
+	if got[0].Rule != "r1" || got[1].Rule != "r2" {
+		t.Fatalf("事件顺序/内容不符: %+v", got)
+	}
+}
+
 // TestConfig_告警段校验 验证新增配置段的默认值与非法引用拦截。
 func TestConfig_告警段校验(t *testing.T) {
 	base := func() *config.Config {
@@ -341,4 +379,61 @@ func TestConfig_告警段校验(t *testing.T) {
 	if err := c.Validate(); err == nil {
 		t.Fatal("引用不存在的模型路由应报错")
 	}
+}
+
+// ——— M13：leader 翻转/重启后的重复 firing 通知去重 ———
+
+// TestM13FiringDedupeWindow 连续 firing（无 resolved 间隔）在窗口内只通知
+// 一条；resolved 重置窗口，之后的 firing 重新生效。
+func TestM13FiringDedupeWindow(t *testing.T) {
+	col := &collector{}
+	srv := httptest.NewServer(col.handler())
+	defer srv.Close()
+
+	n := NewNotifier([]config.WebhookConfig{webhookCfg("w1", srv.URL, 0)}, nil)
+	n.SetDedupeWindow(time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.Run(ctx)
+
+	fire := func() {
+		n.Send(Event{Type: TypeAlert, Rule: "r1", Instance: "b1", Status: StatusFiring, Summary: "s"}, []string{"w1"})
+	}
+	resolve := func() {
+		n.Send(Event{Type: TypeAlert, Rule: "r1", Instance: "b1", Status: StatusResolved, Summary: "s"}, []string{"w1"})
+	}
+
+	// 第一次 firing → 收到。
+	fire()
+	waitFor(t, 2*time.Second, func() bool { return len(col.snapshot()) == 1 }, "首次 firing 应送达")
+	// 窗口内重复 firing（模拟 leader 翻转/重启后新实例重建状态再 fire）→ 去重。
+	fire()
+	time.Sleep(30 * time.Millisecond)
+	if got := len(col.snapshot()); got != 1 {
+		t.Fatalf("窗口内重复 firing 应被去重，实际收到 %d 条", got)
+	}
+	// resolved → 送达（不能因去重丢失解决通知）。
+	resolve()
+	waitFor(t, 2*time.Second, func() bool { return len(col.snapshot()) == 2 }, "resolved 应送达")
+	// resolved 重置窗口：再次 firing 重新生效。
+	fire()
+	waitFor(t, 2*time.Second, func() bool { return len(col.snapshot()) == 3 }, "resolved 后 firing 应重新生效")
+}
+
+// TestM13DedupeWindowDisabled 窗口为 0（关闭）时重复 firing 照常送达
+// （兼容启用了 repeat_interval 需要高频重发的规则）。
+func TestM13DedupeWindowDisabled(t *testing.T) {
+	col := &collector{}
+	srv := httptest.NewServer(col.handler())
+	defer srv.Close()
+
+	n := NewNotifier([]config.WebhookConfig{webhookCfg("w1", srv.URL, 0)}, nil) // 默认窗口 0
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.Run(ctx)
+
+	for i := 0; i < 2; i++ {
+		n.Send(Event{Type: TypeAlert, Rule: "r1", Instance: "b1", Status: StatusFiring, Summary: "s"}, []string{"w1"})
+	}
+	waitFor(t, 2*time.Second, func() bool { return len(col.snapshot()) == 2 }, "窗口关闭时两条 firing 均应送达")
 }

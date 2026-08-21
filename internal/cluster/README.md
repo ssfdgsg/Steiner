@@ -1,5 +1,7 @@
 # internal/cluster — 多实例协调层
 
+> 🌐 [English](README.en.md) | 简体中文
+
 以 Redis 为唯一协调存储，让多个网关实例可水平部署。`cluster.enabled=false`
 （缺省）时本模块完全不参与，行为与单机模式一致。
 

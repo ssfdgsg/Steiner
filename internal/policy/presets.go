@@ -90,14 +90,22 @@ func FindPreset(name string) *Preset {
 	return nil
 }
 
-// MatchPreset 反查：给定策略表达式，返回与之完全一致的预设名，
-// 无匹配返回 "custom"。用于展示"当前生效方案"——不需要额外存状态，
-// 集群广播后各实例的判定天然一致。
-func MatchPreset(filter, score string) string {
-	for i := range Presets {
-		if Presets[i].Filter == filter && Presets[i].Score == score {
-			return Presets[i].Name
-		}
+// MatchPreset 返回策略槽位当前生效方案的预设名；未使用预设返回 "custom"。
+// 用于展示"当前生效方案"。
+//
+// L3 修复：旧实现以"表达式字符串与预设完全相等"反查预设名，导致手写、
+// 恰好与预设字符串逐字相同的 filter/score（典型：内置默认策略与 balanced
+// 表达式完全相同）被管理面/状态视图误标为"使用了预设"。修复后预设名
+// 只来自**显式声明**：explicitPreset 为配置中显式声明的 preset 字段
+// （config.PolicyConfig.Preset），非空且指向存在的预设才返回该预设名；
+// 手写表达式（即使与预设字符串逐字相同）一律视为自定义，返回 "custom"。
+//
+// 变参保持旧两参调用点（internal/server 的 handlePresetsGet）编译兼容：
+// 调用方必须把配置声明的预设字段传进来才能正确展示来源，不传即视为
+// 手写表达式，返回 "custom"。
+func MatchPreset(filter, score string, explicitPreset ...string) string {
+	if len(explicitPreset) > 0 && explicitPreset[0] != "" && FindPreset(explicitPreset[0]) != nil {
+		return explicitPreset[0]
 	}
 	return "custom"
 }

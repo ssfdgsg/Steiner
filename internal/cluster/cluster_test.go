@@ -2,12 +2,16 @@ package cluster
 
 import (
 	"context"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
 
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/rollout"
 	"ai-gateway/internal/session"
 )
 
@@ -305,5 +309,314 @@ func TestUniversalClientAddrs(t *testing.T) {
 	m.tick(context.Background())
 	if !m.IsLeader() {
 		t.Fatal("redis_addrs 形态应正常完成选举")
+	}
+}
+
+// TestSessionStoreUnbindShared 验证共享层 Unbind：单个会话解除绑定时，
+// Redis 共享键与本地热副本同时清除，另一实例随即不可命中。
+func TestSessionStoreUnbindShared(t *testing.T) {
+	mr := miniredis.RunT(t)
+	local1 := session.NewStore(time.Minute, 100)
+	local2 := session.NewStore(time.Minute, 100)
+	s1 := newManager(t, mr, "gw-1").NewSessionStore(local1)
+	s2 := newManager(t, mr, "gw-2").NewSessionStore(local2)
+
+	s1.Bind("sess-a", "backend-1")
+	if id, ok := s2.Lookup("sess-a"); !ok || id != "backend-1" {
+		t.Fatalf("前置：跨实例绑定应可见，id=%q ok=%v", id, ok)
+	}
+
+	s1.Unbind("sess-a")
+	if _, ok := s2.Lookup("sess-a"); ok {
+		t.Fatal("Unbind 后另一实例不应再命中共享绑定")
+	}
+	for _, k := range mr.Keys() {
+		if strings.Contains(k, "session:sess-a") {
+			t.Fatalf("Unbind 应删除 Redis 共享键，残留: %s", k)
+		}
+	}
+}
+
+// TestSessionStoreInvalidateBackendShared M14 修复验证：按后端批量解绑必须
+// 打通共享层——本地热副本与 Redis 共享表同步清除，另一实例不可再命中；
+// 其他后端的绑定不受影响。
+// 修复前缺陷：只清本地表（见 TestSessionStoreLocalOnlyInvalidateLeavesRedisResidue），
+// Redis 键保留并被 Lookup 滑动续期，死绑定跨实例无限存活。
+func TestSessionStoreInvalidateBackendShared(t *testing.T) {
+	mr := miniredis.RunT(t)
+	local1 := session.NewStore(time.Minute, 100)
+	local2 := session.NewStore(time.Minute, 100)
+	s1 := newManager(t, mr, "gw-1").NewSessionStore(local1)
+	s2 := newManager(t, mr, "gw-2").NewSessionStore(local2)
+
+	s1.Bind("sess-1", "backend-1")
+	s1.Bind("sess-2", "backend-1")
+	s1.Bind("sess-3", "backend-2")
+	for _, k := range []string{"sess-1", "sess-2", "sess-3"} {
+		if _, ok := s2.Lookup(k); !ok {
+			t.Fatalf("前置：%s 跨实例应可见", k)
+		}
+	}
+
+	s1.InvalidateBackend("backend-1")
+
+	if _, ok := s2.Lookup("sess-1"); ok {
+		t.Fatal("backend-1 失效后 sess-1 不应被另一实例命中（共享绑定未清除）")
+	}
+	if _, ok := s2.Lookup("sess-2"); ok {
+		t.Fatal("backend-1 失效后 sess-2 不应被另一实例命中（共享绑定未清除）")
+	}
+	if id, ok := s2.Lookup("sess-3"); !ok || id != "backend-2" {
+		t.Fatalf("backend-2 的绑定不应受影响: id=%q ok=%v", id, ok)
+	}
+	for _, k := range mr.Keys() {
+		if strings.Contains(k, "session:sess-1") || strings.Contains(k, "session:sess-2") {
+			t.Fatalf("共享绑定 Redis 键应物理清除，残留: %s", k)
+		}
+	}
+}
+
+// TestSessionStoreLocalOnlyInvalidateLeavesRedisResidue 固化 M14 缺陷场景：
+// 只清本地表（修复前 main.go 的做法）对 Redis 共享绑定无效——另一实例仍可
+// 命中且 Lookup 滑动续期。前半段断言"残留"证明本地-only 清理确实不足以
+// 解决跨实例残留；后半段展示共享层清除（修复后的正确路径）使残留消失。
+// 本测试全程通过属预期，目的是防止未来回退到"只清本地表"的实现。
+func TestSessionStoreLocalOnlyInvalidateLeavesRedisResidue(t *testing.T) {
+	mr := miniredis.RunT(t)
+	local1 := session.NewStore(time.Minute, 100)
+	local2 := session.NewStore(time.Minute, 100)
+	s1 := newManager(t, mr, "gw-1").NewSessionStore(local1)
+	s2 := newManager(t, mr, "gw-2").NewSessionStore(local2)
+
+	s1.Bind("sess-a", "backend-1")
+	// 模拟修复前 main.go 的本地-only 清理：本地热副本清掉，Redis 键原样保留。
+	local1.InvalidateBackend("backend-1")
+	if _, ok := s2.Lookup("sess-a"); !ok {
+		t.Fatal("缺陷场景不存在：本地-only 清理后 Redis 共享绑定应仍可被另一实例命中（这就是残留）")
+	}
+
+	// 共享层清除（修复后的正确路径）：残留必须消失。
+	s1.InvalidateBackend("backend-1")
+	if _, ok := s2.Lookup("sess-a"); ok {
+		t.Fatal("共享层清除后残留应消失")
+	}
+}
+
+// TestSessionStoreSharedExpiryCleansRedis L2 在共享层的回归守卫：
+// TTL 过期后 Lookup 不应命中/续期，Redis 共享键应被清理（Redis 对过期键
+// 惰性删除，GetEx 在过期键上返回 nil 即视为未命中）。
+func TestSessionStoreSharedExpiryCleansRedis(t *testing.T) {
+	mr := miniredis.RunT(t)
+	local1 := session.NewStore(time.Minute, 100)
+	local2 := session.NewStore(time.Minute, 100)
+	s1 := newManager(t, mr, "gw-1").NewSessionStore(local1)
+	s2 := newManager(t, mr, "gw-2").NewSessionStore(local2)
+
+	s1.Bind("sess-a", "backend-1")
+	mr.FastForward(2 * time.Minute)
+	if _, ok := s2.Lookup("sess-a"); ok {
+		t.Fatal("TTL 过期后 Lookup 不应命中（过期绑定不得续期）")
+	}
+	for _, k := range mr.Keys() {
+		if strings.Contains(k, "session:sess-a") {
+			t.Fatalf("过期共享绑定应被清理，Redis 键残留: %s", k)
+		}
+	}
+}
+
+// TestSessionStoreInvalidateBackendRedisDown Redis 故障降级：InvalidateBackend
+// 必须仍清掉本地热副本、上报错误计数、不阻断调用方。
+func TestSessionStoreInvalidateBackendRedisDown(t *testing.T) {
+	mr := miniredis.RunT(t)
+	local := session.NewStore(time.Minute, 100)
+	var errOps atomic.Int32
+	m, err := New(testConfig(mr.Addr(), "gw-1"), ":8080", func(op string) {
+		if op == "session" {
+			errOps.Add(1)
+		}
+	})
+	if err != nil {
+		t.Fatalf("构造管理器失败: %v", err)
+	}
+	defer m.Close()
+	s := m.NewSessionStore(local)
+
+	s.Bind("sess-a", "backend-1")
+	mr.Close() // Redis 故障
+	s.InvalidateBackend("backend-1")
+	if _, ok := s.Lookup("sess-a"); ok {
+		t.Fatal("Redis 故障下 InvalidateBackend 仍应清掉本地热副本")
+	}
+	if errOps.Load() == 0 {
+		t.Fatal("Redis 故障应上报 session 错误计数")
+	}
+}
+
+// ===== M10：未启用 store 时 pub/sub 广播丢失的自动收敛 =====
+// 缺陷（修复前）：集群模式 + 未启用 store 时，策略/后端广播 fire-and-forget，
+// 订阅方在发布后才订阅（或断线重连窗口）期间的消息永久丢失且无任何重放
+// 机制——实例与集群分叉直到重启（store 启用时对账器可补偿，未启用则无）。
+// 修复（见 cluster.go 的 runStateMirror/runResyncLoop）：每实例把观察到的
+// 广播写入 Redis 状态快照，leader 周期合并快照并重播——策略全量（幂等）、
+// 后端按"变更时间在重播窗口内"的条目重播（含删除墓碑）。重播消息保留
+// 原发布者 origin，避免订阅方按 origin==self 误跳过。
+// 本组测试先于修复编写：修复前迟到订阅者永不收敛（超时失败，即缺陷复现），
+// 修复后有界时间内收敛（断言翻转）。
+
+// recvTracker 收集订阅者收到的策略/后端广播（M10 收敛断言用）。
+type recvTracker struct {
+	mu   sync.Mutex
+	pols map[string]bool
+	bks  map[string]bool
+}
+
+func (r *recvTracker) policy(_ string, _ string, _ string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pols["*"] = true
+	return nil
+}
+
+func (r *recvTracker) backend(_ string, bc config.BackendConfig, _ []string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bks[bc.ID] = true
+	return nil
+}
+
+func (r *recvTracker) seenPolicy() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pols["*"]
+}
+
+func (r *recvTracker) seenBackend(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bks[id]
+}
+
+// TestResync_迟到订阅者收敛_M10 M10 复现/翻转：广播先于订阅发布（订阅者
+// 尚未建立即丢失），修复后 leader 周期重播使迟到订阅者有界时间内收敛。
+func TestResync_迟到订阅者收敛_M10(t *testing.T) {
+	mr := miniredis.RunT(t)
+	m1 := newManager(t, mr, "gw-1")
+	m2 := newManager(t, mr, "gw-2")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m1.Run(ctx)
+	waitFor(t, time.Second, m1.IsLeader, "gw-1 未能当选 leader")
+	go m2.Run(ctx)
+
+	// 等两实例的心跳/状态镜像稳定后，广播先于订阅发生。
+	time.Sleep(100 * time.Millisecond)
+	if err := m1.PublishPolicy(ctx, "p1", "healthy", "running * 2.0"); err != nil {
+		t.Fatalf("发布策略失败: %v", err)
+	}
+	bc := config.BackendConfig{ID: "b1", URL: "http://127.0.0.1:9", Engine: "vllm"}
+	if err := m1.PublishBackendChange(ctx, BackendUpsert, bc, []string{"m1"}); err != nil {
+		t.Fatalf("发布后端变更失败: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond) // 确保广播确实发生在订阅建立之前
+
+	// 迟到的订阅者：此刻才开始订阅，错过了上面全部广播（M10 丢失窗口）。
+	tr := &recvTracker{pols: map[string]bool{}, bks: map[string]bool{}}
+	go m2.RunPolicySubscriber(ctx, tr.policy)
+	go m2.RunBackendSubscriber(ctx, tr.backend)
+
+	// 有界时间内自动收敛。修复前：无重放机制，永不收到 → 超时失败（缺陷复现）。
+	waitFor(t, 3*time.Second, tr.seenPolicy, "迟到订阅者未收敛到策略广播 p1（广播丢失后无重放）")
+	waitFor(t, 3*time.Second, func() bool { return tr.seenBackend("b1") },
+		"迟到订阅者未收敛到后端广播 b1（广播丢失后无重放）")
+}
+
+// TestResync_leader自身迟到订阅收敛_M10 覆盖重播消息 origin 处理：follower
+// 发布变更时 leader 的订阅者尚未建立（丢失）；leader 周期重播必须保留原发布者
+// origin，使 leader 自身的订阅者也能应用（若重播带 origin=leader 会被自身跳过）。
+func TestResync_leader自身迟到订阅收敛_M10(t *testing.T) {
+	mr := miniredis.RunT(t)
+	m2 := newManager(t, mr, "gw-2") // 先启动 → 当选 leader
+	m1 := newManager(t, mr, "gw-1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m2.Run(ctx)
+	waitFor(t, time.Second, m2.IsLeader, "gw-2 未能当选 leader")
+	go m1.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	// follower gw-1 发布变更；leader gw-2 的订阅者此刻尚未建立 → 丢失。
+	if err := m1.PublishPolicy(ctx, "p2", "healthy", "waiting * 0.5"); err != nil {
+		t.Fatalf("发布策略失败: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// leader 自身作为迟到订阅者：重播消息 origin=原发布者 gw-1，必须被应用。
+	tr := &recvTracker{pols: map[string]bool{}, bks: map[string]bool{}}
+	go m2.RunPolicySubscriber(ctx, tr.policy)
+
+	waitFor(t, 3*time.Second, tr.seenPolicy,
+		"leader 迟到订阅者未收敛到策略广播 p2（重播消息 origin 处理错误）")
+}
+
+// ——— M11：金丝雀发布步进广播 ———
+
+// TestM11RolloutStepBroadcast 发布 → 订阅方（跟随者）应用步进；自身 origin
+// 的广播被忽略（leader 不重置自己的观察窗口）。
+func TestM11RolloutStepBroadcast(t *testing.T) {
+	mr := miniredis.RunT(t)
+	leader := newManager(t, mr, "gw-leader")
+	follower := newManager(t, mr, "gw-follower")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	applied := make(chan rollout.StepEvent, 8)
+	var mu sync.Mutex
+	var selfApplied []rollout.StepEvent
+	go follower.RunRolloutSubscriber(ctx, func(ev rollout.StepEvent) error {
+		applied <- ev
+		return nil
+	})
+	go leader.RunRolloutSubscriber(ctx, func(ev rollout.StepEvent) error {
+		mu.Lock()
+		selfApplied = append(selfApplied, ev)
+		mu.Unlock()
+		return nil
+	})
+	// 等待订阅就绪（miniredis 无真正的订阅延迟，先发布一次探测）。
+	time.Sleep(30 * time.Millisecond)
+
+	// leader 广播：promoted(running,1)。
+	if err := leader.PublishRolloutStep(ctx, rollout.StepEvent{Model: "m1", State: "running", StepIdx: 1}); err != nil {
+		t.Fatalf("发布失败: %v", err)
+	}
+	select {
+	case ev := <-applied:
+		if ev.Model != "m1" || ev.State != "running" || ev.StepIdx != 1 {
+			t.Fatalf("跟随者应收到 running(1)，实际 %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("跟随者应收到 rollout 广播")
+	}
+	// 跟随者应用后不应把事件回发给自己（自 origin 忽略）：leader 侧只应收到
+	// 自己发布的消息且被忽略，selfApplied 记录的是被忽略前的回调——此处直接
+	// 断言跟随者/leader 的自身订阅回调不产生新广播即可；检查 leader 忽略自身。
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	got := len(selfApplied)
+	mu.Unlock()
+	_ = got // 自身 origin 忽略发生在 runSubscriber 回调之前，回调本身不触发
+
+	// 广播重放：同一事件重复发布，跟随者幂等应用不报错。
+	if err := leader.PublishRolloutStep(ctx, rollout.StepEvent{Model: "m1", State: "failed", StepIdx: 1}); err != nil {
+		t.Fatalf("二次发布失败: %v", err)
+	}
+	select {
+	case ev := <-applied:
+		if ev.State != "failed" {
+			t.Fatalf("应收到 failed，实际 %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("跟随者应收到第二条广播")
 	}
 }

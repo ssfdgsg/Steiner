@@ -163,3 +163,60 @@ func TestLinkInflightAccounting(t *testing.T) {
 		t.Fatalf("在途计数期望 1，实际 %d", l.Inflight())
 	}
 }
+
+// ——— H9：会话粘性 PickPreferred ———
+
+// TestPickPreferredHonorsBinding 绑定 prefill 可用时优先选中（KV 亲和）。
+func TestPickPreferredHonorsBinding(t *testing.T) {
+	m, sched, _ := newFixture(t, pdConfig(nil))
+	g := m.Get("g")
+	req := &scheduler.Request{Model: "m"}
+	for i := 0; i < 10; i++ {
+		p, _, _, err := g.PickPreferred(sched, req, "p2", nil, nil)
+		if err != nil {
+			t.Fatalf("PickPreferred 失败: %v", err)
+		}
+		if p.ID != "p2" {
+			t.Fatalf("应优先绑定 prefill p2，实际 %s", p.ID)
+		}
+	}
+}
+
+// TestPickPreferredFallsBackWhenBoundUnavailable 绑定 prefill 已摘除/不可用时
+// 回退普通选路（仍能成功选对）。
+func TestPickPreferredFallsBackWhenBoundUnavailable(t *testing.T) {
+	m, sched, reg := newFixture(t, pdConfig(nil))
+	g := m.Get("g")
+	// 熔断摘除 p1（健康摘除 → Available=false；摘除后组内切片陈旧是另一
+	// 潜在问题，不在 H9 范围）。
+	reg.Get("p1").MarkFailure(1, time.Minute)
+	req := &scheduler.Request{Model: "m"}
+	p, _, _, err := g.PickPreferred(sched, req, "p1", nil, nil)
+	if err != nil {
+		t.Fatalf("绑定失效应回退普通选路: %v", err)
+	}
+	if p.ID != "p2" {
+		t.Fatalf("回退后应选 p2，实际 %s", p.ID)
+	}
+	// PrefillAvailable 同步返回 false（servePD 据此自愈 Unbind）。
+	if g.PrefillAvailable("p1") {
+		t.Fatal("熔断摘除的 prefill 不应可用")
+	}
+	if !g.PrefillAvailable("p2") {
+		t.Fatal("存活 prefill 应可用")
+	}
+}
+
+// TestPickPreferredRespectsExclude 绑定 prefill 被本轮排除（已失败）时回退。
+func TestPickPreferredRespectsExclude(t *testing.T) {
+	m, sched, _ := newFixture(t, pdConfig(nil))
+	g := m.Get("g")
+	req := &scheduler.Request{Model: "m"}
+	p, _, _, err := g.PickPreferred(sched, req, "p2", map[string]bool{"p2": true}, nil)
+	if err != nil {
+		t.Fatalf("PickPreferred 失败: %v", err)
+	}
+	if p.ID != "p1" {
+		t.Fatalf("排除 p2 后应回退 p1，实际 %s", p.ID)
+	}
+}

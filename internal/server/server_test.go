@@ -28,6 +28,7 @@ func newTestServer(t *testing.T) *Server {
 			{ID: "b2", URL: "http://127.0.0.1:2", Engine: "sglang"},
 		},
 		Models: []config.ModelRoute{{Name: "m1", Backends: []string{"b1", "b2"}}},
+		Server: config.ServerConfig{AdminToken: "test-token"},
 	}
 	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
@@ -61,7 +62,10 @@ func do(t *testing.T, s *Server, method, path, body string) *httptest.ResponseRe
 		req = httptest.NewRequest(method, path, nil)
 	} else {
 		req = httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
 	}
+	// 管理面测试默认携带测试令牌（有鉴权保护的端点需要）。
+	req.Header.Set("Authorization", "Bearer "+s.cfg.Server.AdminToken)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	return rec
@@ -116,6 +120,30 @@ func TestCordonUncordon(t *testing.T) {
 	}
 }
 
+func TestPolicyValidate(t *testing.T) {
+	s := newTestServer(t)
+	before := s.pol.Get("default").ScoreSrc
+
+	rec := do(t, s, "POST", "/admin/policies/validate", `{"filter":"healthy && kv_usage < 0.9","score":"waiting * 5.0"}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"valid": true`) ||
+		!strings.Contains(rec.Body.String(), `"errors": []`) {
+		t.Fatalf("合法表达式应通过校验且 errors 稳定为空数组: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := s.pol.Get("default").ScoreSrc; got != before {
+		t.Fatalf("校验不应改变运行策略: %q -> %q", before, got)
+	}
+
+	rec = do(t, s, "POST", "/admin/policies/validate", `{"filter":"healthy &&","score":"waiting *"}`)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"valid": false`) ||
+		!strings.Contains(rec.Body.String(), `"field": "filter"`) ||
+		!strings.Contains(rec.Body.String(), `"field": "score"`) {
+		t.Fatalf("非法表达式应返回分字段错误: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := s.pol.Get("default").ScoreSrc; got != before {
+		t.Fatalf("失败校验不应改变运行策略: %q -> %q", before, got)
+	}
+}
+
 func TestPolicyHotUpdate(t *testing.T) {
 	s := newTestServer(t)
 	// 合法更新生效。
@@ -162,5 +190,43 @@ func TestAlertsDisabled(t *testing.T) {
 	rec = do(t, s, "GET", "/admin/autoscale", "")
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "false") {
 		t.Fatalf("未启用扩缩容时应返回 enabled=false: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// fakeSessionStore 记录 InvalidateBackend 调用（M14 摘除联动验证）。
+type fakeSessionStore struct {
+	invalidated []string
+}
+
+func (f *fakeSessionStore) Lookup(string) (string, bool) { return "", false }
+func (f *fakeSessionStore) Bind(string, string)          {}
+func (f *fakeSessionStore) Unbind(string)                {}
+func (f *fakeSessionStore) InvalidateBackend(id string)  { f.invalidated = append(f.invalidated, id) }
+
+// TestM14AdminRemoveBackendInvalidatesSessionBindings 管理面摘除后端时,
+// 会话粘性存储同步清除该后端的全部绑定(本地+共享),避免死绑定被续期。
+func TestM14AdminRemoveBackendInvalidatesSessionBindings(t *testing.T) {
+	s := newTestServer(t)
+	fake := &fakeSessionStore{}
+	s.SetSessionStore(fake)
+
+	// 先注册再摘除。
+	rec := httptest.NewRecorder()
+	req := authReq(http.MethodPost, "/admin/backends",
+		`{"id":"victim","url":"http://victim.invalid/","engine":"vllm","models":["m1"]}`,
+		adminToken, "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("前置注册失败: %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = authReq(http.MethodDelete, "/admin/backends/victim", "", adminToken, "")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("摘除应 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(fake.invalidated) != 1 || fake.invalidated[0] != "victim" {
+		t.Fatalf("摘除应联动 InvalidateBackend(victim)，实际 %v", fake.invalidated)
 	}
 }

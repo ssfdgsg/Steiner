@@ -324,3 +324,38 @@ func TestConcurrencyCapExcludes(t *testing.T) {
 		t.Fatalf("并发满额的 b1 不应入选，实际 %s", got.ID)
 	}
 }
+
+func TestPromptRequirements(t *testing.T) {
+	e := policy.NewEngine()
+	if err := e.Set("default", "healthy", "running - prefix_match"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Set("cost-aware", "healthy", "running + prompt_len + image_count"); err != nil {
+		t.Fatal(err)
+	}
+
+	route := &backend.Route{Name: "m", Strategy: "expression", PolicyName: "default"}
+	s := New(e, nil, kvCfg())
+	if features, limit := s.PromptRequirements(route, false); features || limit != 0 {
+		t.Fatalf("无 KV 且策略只用 prefix_match 时应走轻量解析: features=%v limit=%d", features, limit)
+	}
+
+	route.PolicyName = "cost-aware"
+	if features, limit := s.PromptRequirements(route, false); !features || limit != 0 {
+		t.Fatalf("策略使用 prompt 特征时应解析但不保留文本: features=%v limit=%d", features, limit)
+	}
+
+	route.Strategy, route.PolicyName = "consistent_hash", ""
+	if features, limit := s.PromptRequirements(route, false); !features || limit != -1 {
+		t.Fatalf("无 session 的一致性哈希应保留完整 prompt: features=%v limit=%d", features, limit)
+	}
+	if features, limit := s.PromptRequirements(route, true); features || limit != 0 {
+		t.Fatalf("有 session 的一致性哈希不需要 prompt: features=%v limit=%d", features, limit)
+	}
+
+	route.Strategy = "least_request"
+	s = New(e, kvcache.NewTree(4096, time.Minute), kvCfg())
+	if features, limit := s.PromptRequirements(route, false); !features || limit != 4096 {
+		t.Fatalf("KV 前缀树应只保留配置上限: features=%v limit=%d", features, limit)
+	}
+}

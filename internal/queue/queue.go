@@ -34,6 +34,12 @@ type Queue struct {
 	classMu sync.Mutex
 	classes map[string]int64
 
+	// waiters 等待者计数：WaitFor 阻塞前 +1、退出时 -1。
+	// Signal 依据 waiters 而非队列深度决定是否广播——深度在等待者进出间
+	// 可能瞬时归零（如上一等待者刚拿到容量退出），若只看深度会在这类
+	// 窗口内丢信号，等待者只能等 100ms 兜底轮询，放大排队时延。
+	waiters atomic.Int64
+
 	mu sync.Mutex
 	ch chan struct{} // 广播通道：Signal 时关闭并更换
 }
@@ -79,8 +85,10 @@ func (q *Queue) leaveClass(class string) {
 // 在请求完成释放并发额度、后端恢复健康等时机调用。
 // 无人排队时直接返回：调用方（每个请求完成路径）无需感知队列状态，
 // 空队列的高频 Signal 不再触发加锁与 channel 重建。
+// 判定依据是等待者计数而非队列深度：深度会在等待者进出窗口内瞬时归零
+// （上一等待者刚退出），此时仍有等待者正在阻塞，信号不能被丢弃。
 func (q *Queue) Signal() {
-	if q.depth.Load() == 0 {
+	if q.waiters.Load() == 0 {
 		return
 	}
 	q.mu.Lock()
@@ -113,6 +121,13 @@ func (q *Queue) WaitFor(ctx context.Context, class string, retry func() bool) er
 	// 兜底轮询：唤醒信号可能在极端时序下丢失（先 Signal 后取通道）。
 	fallback := time.NewTicker(100 * time.Millisecond)
 	defer fallback.Stop()
+
+	// 阻塞前登记为等待者：Signal 依据 waiters 决定是否广播。
+	// 必须先于取通道（waitCh）完成——若 Signal 先于本语句发生，
+	// waiters 仍为 0 而无人需要被唤醒，语义正确；反之 Signal 看到
+	// waiters>0 必然广播，等待者随后取到的新通道不会吞掉信号。
+	q.waiters.Add(1)
+	defer q.waiters.Add(-1)
 
 	for {
 		ch := q.waitCh()

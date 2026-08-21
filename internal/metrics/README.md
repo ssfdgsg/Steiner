@@ -1,5 +1,7 @@
 # internal/metrics/ — 指标子系统（双通道 + 自身导出）
 
+> 🌐 [English](README.en.md) | 简体中文
+
 ## 职责
 ```
 后端 /metrics ──(Scraper, 秒级)──▶ backend.Snapshot（原子指针发布）─▶ 调度热路径无锁读
@@ -65,6 +67,20 @@ PromQL 负责**引擎暴露不了的外部信号**（DCGM GPU 利用率、温度
 归一化视图（`gateway_backend_*`）由自定义 Collector 在抓取瞬间实时读原子快照，
 Prometheus 只抓网关即可获得全集群引擎负载，且后端摘除后不留陈旧序列。
 
+## 管理面聚合与时序（stats.go + history.go）
+控制台需要「当前吞吐是多少、时延分位数如何、最近几小时的趋势」，但控制台不应被迫
+依赖外部 Prometheus 才能显示基础 KPI。因此：
+
+- `stats.go` 的 `Gateway.Aggregate()` 直接 `Registry.Gather()` 汇总——**与 `/metrics`
+  同源同口径**，不新增运行期计数状态。分位数由直方图累计桶线性插值估算，精度受桶边界
+  限制，用于趋势判断而非 SLA 计算；`code >= 400` 与非数字码计为错误。
+- `history.go` 的 `History` 是进程内环形缓冲（默认 15s × 1440 ≈ 6 小时，见
+  `cmd/gateway/main.go` 常量），周期采样并对 counter 做差分得到瞬时 RPS / 错误率 /
+  区间平均时延；排队深度、可用实例数、KV 规模等不在自身指标里的运行态由装配期注入的
+  `RuntimeProbe` 同点采集，保证各维度时间对齐。首个采样点仅作基线不入缓冲。
+- 边界：缓冲不持久化、不跨实例聚合，重启即清空。长周期、高保真、跨副本的时序仍以
+  Prometheus 为事实来源，控制台在图表旁保留 `/metrics` 入口。
+
 ## 文件
 | 文件 | 说明 |
 |---|---|
@@ -73,4 +89,7 @@ Prometheus 只抓网关即可获得全集群引擎负载，且后端摘除后不
 | `promql.go` | 外部 Prometheus 周期查询与变量注入 |
 | `exporter.go` | 网关自身指标集 |
 | `collector.go` | 后端归一化视图 / 路由分流计数透出 |
+| `stats.go` | 管理面聚合统计（Registry 汇总、直方图分位数估算） |
+| `history.go` | 管理面时序环形缓冲与运行态探针 |
 | `scraper_test.go` | 双引擎解析、速率派生、失败保旧值、counter 命中率用例 |
+| `stats_test.go` | 聚合口径、差分语义与缓冲淘汰用例 |

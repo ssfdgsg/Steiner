@@ -129,6 +129,13 @@ type ClusterConfig struct {
 	//   distributed  集群级 GCRA 配额，全部实例共享 rate_limit_qps（缺省）；
 	//   local        各实例独立限流，总放行量 = 配额 × 实例数。
 	RateLimitMode string `yaml:"rate_limit_mode"`
+	// RateLimitFailOpen Redis 不可用时分布式限流的降级策略（可用性/严格性权衡）：
+	//   true  （缺省）→ 退回本地令牌桶放行，数据面保持可用；故障期间每实例
+	//          各自放行满额本地桶，集群总量可能 N× 超额，属既定语义（可用性优先）；
+	//   false → 直接拒绝，严格限额，宁可误杀不可超额。
+	// 只在 rate_limit_mode: distributed 下有意义；local 模式下本字段被忽略。
+	// 用 *bool 承载"未显式设置即默认 true"（bool 零值为 false，无法表达该缺省）。
+	RateLimitFailOpen *bool `yaml:"rate_limit_fail_open"`
 	// SessionMode 会话粘性模式：
 	//   shared  绑定表存 Redis，跨实例一致（缺省）；
 	//   local   各实例独立绑定，需前置 LB 按会话键做一致性哈希。
@@ -193,7 +200,11 @@ type QueueConfig struct {
 // ServerConfig 为 HTTP 服务与转发行为配置。
 type ServerConfig struct {
 	// Listen 监听地址，业务、指标与管理接口共用同一端口。
+	// 默认仅监听本机回环（127.0.0.1:8080）；需要对外暴露时显式配置 0.0.0.0:8080。
 	Listen string `yaml:"listen"`
+	// AdminToken 管理面 Bearer 令牌，必填：所有 /admin/* 请求须携带
+	// Authorization: Bearer <token>，未配置时拒绝启动。
+	AdminToken string `yaml:"admin_token"`
 	// MaxBodyBytes 请求体大小上限，防止异常大包拖垮网关。
 	MaxBodyBytes int64 `yaml:"max_body_bytes"`
 	// Retries 转发失败（未写出任何字节前）的最大重试次数，重试会换后端。
@@ -252,6 +263,12 @@ type KVCacheConfig struct {
 	// 候选后端负载 > abs 且 > rel * 最小负载时放弃亲和，回退最小负载路由。
 	BalanceAbsThreshold float64 `yaml:"balance_abs_threshold"`
 	BalanceRelThreshold float64 `yaml:"balance_rel_threshold"`
+	// MaxNodes 前缀树节点数硬上限（H8）：插入超限时按最久未访问归属逐代淘汰，
+	// 保证异常/高基数输入下树规模有界。0 时按默认值 100000。
+	MaxNodes int64 `yaml:"max_nodes"`
+	// MaxBytes 前缀树边字节数硬上限（H8）：语义同 MaxNodes，双维度任一超限即
+	// 触发淘汰。0 时按默认值 256MiB。
+	MaxBytes int64 `yaml:"max_bytes"`
 }
 
 // PolicyConfig 为一条可动态编译的调度策略。
@@ -368,9 +385,14 @@ type NCCLLinkConfig struct {
 type AlertingConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// Interval 规则求值周期。
-	Interval Duration          `yaml:"interval"`
-	Webhooks []WebhookConfig   `yaml:"webhooks"`
-	Rules    []AlertRuleConfig `yaml:"rules"`
+	Interval Duration `yaml:"interval"`
+	// DedupeFiringWindow M13 连续 firing 去重窗：告警状态机在 leader 翻转/重启后
+	// 重置，同一规则持续触发会产生重复 firing 通知；窗口内（无 resolved 间隔）
+	// 同一 (规则,实例) 的 firing 通知最多一条。0 = 关闭（如规则启用了
+	// repeat_interval 且需要更快重发时）。
+	DedupeFiringWindow Duration          `yaml:"dedupe_firing_window"`
+	Webhooks           []WebhookConfig   `yaml:"webhooks"`
+	Rules              []AlertRuleConfig `yaml:"rules"`
 }
 
 // WebhookConfig 为一个 webhook 通知目标。
@@ -480,13 +502,19 @@ func Load(path string) (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	// 安全门（C1）：管理面 /admin/* 的 Bearer 令牌必填，缺省拒绝启动。
+	// 放在入口 Load 而非库级 Validate：库用户（测试/嵌入）显式构造配置时
+	// 自行决定，运行中的网关进程必须强制。
+	if cfg.Server.AdminToken == "" {
+		return nil, fmt.Errorf("配置校验失败: server.admin_token 必填（管理面 /admin/* 需 Bearer 认证，拒绝裸奔启动）")
+	}
 	return &cfg, nil
 }
 
 // ApplyDefaults 填充所有缺省值，保证下游模块无需判空。
 func (c *Config) ApplyDefaults() {
 	if c.Server.Listen == "" {
-		c.Server.Listen = ":8080"
+		c.Server.Listen = "127.0.0.1:8080"
 	}
 	if c.Server.MaxBodyBytes <= 0 {
 		c.Server.MaxBodyBytes = 32 << 20
@@ -551,6 +579,14 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.KVCache.BalanceRelThreshold <= 0 {
 		c.KVCache.BalanceRelThreshold = 1.5
+	}
+	// H8 内存硬上限默认值：按 100 QPS 唯一前缀 × 10 分钟 ≈ 6 万节点的评估
+	// 留余量（10 万节点 ≈ 数百 MB 级），显式 0 视为"未配置"取默认。
+	if c.KVCache.MaxNodes == 0 {
+		c.KVCache.MaxNodes = 100000
+	}
+	if c.KVCache.MaxBytes == 0 {
+		c.KVCache.MaxBytes = 256 << 20 // 256MiB
 	}
 
 	if c.Session.TTL <= 0 {
@@ -636,6 +672,9 @@ func (c *Config) ApplyDefaults() {
 	if c.Alerting.Interval <= 0 {
 		c.Alerting.Interval = Duration(5 * time.Second)
 	}
+	if c.Alerting.DedupeFiringWindow <= 0 {
+		c.Alerting.DedupeFiringWindow = Duration(5 * time.Minute)
+	}
 	for i := range c.Alerting.Webhooks {
 		w := &c.Alerting.Webhooks[i]
 		if w.Template == "" {
@@ -680,6 +719,11 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Cluster.RateLimitMode == "" {
 		c.Cluster.RateLimitMode = "distributed"
+	}
+	// 缺省 fail-open（可用性优先）：仅当未显式配置（指针为 nil）时填充。
+	if c.Cluster.RateLimitFailOpen == nil {
+		v := true
+		c.Cluster.RateLimitFailOpen = &v
 	}
 	if c.Cluster.SessionMode == "" {
 		c.Cluster.SessionMode = "shared"
@@ -917,6 +961,9 @@ func (c *Config) Validate() error {
 		if r.Severity != "info" && r.Severity != "warning" && r.Severity != "critical" {
 			return fmt.Errorf("配置校验失败: 告警规则 %s 的 severity %q 非法，可选 info/warning/critical", r.Name, r.Severity)
 		}
+		if r.For < 0 {
+			return fmt.Errorf("配置校验失败: 告警规则 %s 的 for 时长不能为负: %v", r.Name, r.For.D())
+		}
 		for _, name := range r.Webhooks {
 			if !webhooks[name] {
 				return fmt.Errorf("配置校验失败: 告警规则 %s 引用了不存在的 webhook %s", r.Name, name)
@@ -990,6 +1037,9 @@ func (c *Config) Validate() error {
 			}
 			prev = s
 		}
+		if r.Steps[len(r.Steps)-1] != 100 {
+			return fmt.Errorf("配置校验失败: rollout 模型 %s 的 steps 末值必须为 100（表示全量放行）", r.Model)
+		}
 		if r.PromoteExpr == "" || r.RollbackExpr == "" {
 			return fmt.Errorf("配置校验失败: rollout 模型 %s 的 promote_expr 与 rollback_expr 均为必填", r.Model)
 		}
@@ -1031,6 +1081,19 @@ func (c *Config) Validate() error {
 		if c.Cluster.SessionMode != "shared" && c.Cluster.SessionMode != "local" {
 			return fmt.Errorf("配置校验失败: cluster.session_mode %q 非法，可选 shared/local", c.Cluster.SessionMode)
 		}
+		if c.Cluster.HeartbeatTTL < c.Cluster.HeartbeatInterval {
+			return fmt.Errorf("配置校验失败: cluster.heartbeat_ttl(%v) 不得小于 heartbeat_interval(%v)（否则成员会在两次心跳间被误判消失）",
+				c.Cluster.HeartbeatTTL.D(), c.Cluster.HeartbeatInterval.D())
+		}
+		if c.Cluster.LeaderTTL < c.Cluster.HeartbeatInterval {
+			return fmt.Errorf("配置校验失败: cluster.leader_ttl(%v) 不得小于 heartbeat_interval(%v)（否则租约会提前过期导致双主）",
+				c.Cluster.LeaderTTL.D(), c.Cluster.HeartbeatInterval.D())
+		}
+	}
+
+	if c.KVCache.MaxNodes < 0 || c.KVCache.MaxBytes < 0 {
+		return fmt.Errorf("配置校验失败: kv_cache.max_nodes(%d)/max_bytes(%d) 不得为负（0 表示取默认值）",
+			c.KVCache.MaxNodes, c.KVCache.MaxBytes)
 	}
 	return nil
 }

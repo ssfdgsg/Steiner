@@ -44,7 +44,32 @@ func TestParseUsageTail_无usage(t *testing.T) {
 	}
 }
 
-// TestTailBuffer_滚动保留 验证尾部缓冲只保留最后 tailCap 字节且 usage 仍可提取。
+// TestParseUsageTail_内容文本伪usage 验证 L1 第一面的修复：
+// 纯文本/裸流模式下，模型输出内容里恰好包含形如 "usage":{...} 的 JSON 文本
+// （如引用工具返回、演示 JSON）时，严格路径不再把它当作真实用量——
+// 修复后应 ok=false（伪 usage 不再误计）。
+func TestParseUsageTail_内容文本伪usage(t *testing.T) {
+	body := []byte(`好的,这是你请求的 JSON 示例:
+"usage": {"prompt_tokens": 999, "completion_tokens": 888, "total_tokens": 1887}`)
+	prompt, completion, ok := parseUsageTail(body)
+	if ok {
+		t.Fatalf("L1 修复失败：内容文本中的伪 usage 不应被计入（严格路径）: prompt=%v completion=%v",
+			prompt, completion)
+	}
+}
+
+// TestParseUsageTail_全零usage漏计 验证 L1 第二面的修复：
+// 合法但全为零的 usage（缓存全命中、max_tokens=0）此前被当作"无 usage"漏计。
+// 修复后（识别到 usage 帧即 ok=true，记账与否由调用方决定）应 ok=true。
+func TestParseUsageTail_全零usage漏计(t *testing.T) {
+	body := []byte(`data: {"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}` + "\n\ndata: [DONE]\n")
+	prompt, completion, ok := parseUsageTail(body)
+	if !ok {
+		t.Fatalf("L1 修复失败：全零 usage 帧应被识别（ok=true）: prompt=%v completion=%v",
+			prompt, completion)
+	}
+}
+
 func TestTailBuffer_滚动保留(t *testing.T) {
 	var tb tailBuffer
 	// 写入远超容量的填充数据，再写入带 usage 的末块。

@@ -3,7 +3,6 @@
 package scheduler
 
 import (
-	"fmt"
 	"hash/fnv"
 	"sort"
 	"strconv"
@@ -57,47 +56,4 @@ func (r *ring) get(key string, ok func(*backend.Backend) bool) *backend.Backend 
 		}
 	}
 	return nil
-}
-
-// pickHash 一致性哈希选路。环按"完整池"构建（保证键落点稳定），
-// 可用性过滤在环上顺时针查找时进行。
-func (s *Scheduler) pickHash(pool, candidates []*backend.Backend, req *Request) *backend.Backend {
-	key := req.SessionID
-	if key == "" {
-		key = req.PromptText
-	}
-	if key == "" {
-		key = req.Model
-	}
-
-	sig := ringSignature(pool)
-	s.ringMu.Lock()
-	rg, okCache := s.rings[sig]
-	if !okCache {
-		// 上限兜底：整体清空避免动态增删后端时缓存无界增长。
-		if len(s.rings) >= maxRingCache {
-			s.rings = map[string]*ring{}
-		}
-		rg = buildRing(pool)
-		s.rings[sig] = rg
-	}
-	s.ringMu.Unlock()
-
-	allowed := make(map[string]bool, len(candidates))
-	for _, b := range candidates {
-		allowed[b.ID] = true
-	}
-	if b := rg.get(key, func(b *backend.Backend) bool { return allowed[b.ID] }); b != nil {
-		return b
-	}
-	return candidates[0]
-}
-
-// ringSignature 环缓存键：池切片的底层数组地址 + 长度。
-// 池是 copy-on-write（Route/Split.SetPool 整体换新切片），同一快照地址稳定、
-// 任何增删/替换（含同 ID 换实例）都产生新地址——天然解决两类问题：
-//  1. 同 ID 换实例后旧环返回已摘除的旧指针（按 ID 签名无法区分）；
-//  2. 每请求对全池做 O(N log N) 排序拼接签名的开销。
-func ringSignature(pool []*backend.Backend) string {
-	return fmt.Sprintf("%p:%d", &pool[0], len(pool))
 }

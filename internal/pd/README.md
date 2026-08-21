@@ -1,5 +1,7 @@
 # internal/pd/ — PD 分离与 NCCL 链路管理
 
+> 🌐 [English](README.en.md) | 简体中文
+
 ## 背景（为什么网关必须感知 NCCL 连接）
 PD 分离（disaggregated serving）下，prefill 实例算完提示词后要把 KV cache 经
 高速通道传给 decode 实例：

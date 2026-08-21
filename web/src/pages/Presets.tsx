@@ -1,173 +1,187 @@
-// 调度方案页：内置方案一键切换 + 手写表达式编辑。
-import { useEffect, useState } from 'react'
-import { api, type PresetsResp } from '../api'
-import { usePoll, useToast } from '../hooks'
-import { Toast } from '../components'
+// 调度方案：展示各策略槽位当前生效方案，支持一键切换与表达式手工热更新。
+import { useState } from 'react'
+import { api, type Preset, type PresetsResp } from '../api'
+import { useInterval, usePoll, useRefreshControl, useToast } from '../hooks'
+import { Async, ConfirmDialog, Panel, StateBlock, Toast } from '../components'
+import { PolicyEditor } from '../components/PolicyEditor'
+import { Icon } from '../icons'
 
 export function Presets() {
-  const { data, error, loading, refresh } = usePoll<PresetsResp>(() => api.presets(), 5000)
+  const { nonce } = useRefreshControl()
+  const state = usePoll(api.presets, useInterval(2), nonce)
   const { toast, show } = useToast()
-  // target 切换目标策略槽位；默认 default，可选其余已存在的策略。
   const [target, setTarget] = useState('default')
-  const [applying, setApplying] = useState<string | null>(null)
+  const [pending, setPending] = useState<Preset | null>(null)
+  const [busy, setBusy] = useState(false)
 
-  // 手写表达式编辑器状态：切换槽位或远端变更时同步，编辑中不覆盖用户输入。
-  const [editing, setEditing] = useState(false)
-  const [filter, setFilter] = useState('')
-  const [score, setScore] = useState('')
-  const current = data?.policies[target]
-
-  useEffect(() => {
-    if (!editing && current) {
-      setFilter(current.filter)
-      setScore(current.score)
-    }
-  }, [current, editing])
-
-  const apply = async (name: string) => {
-    setApplying(name)
+  const apply = async () => {
+    if (!pending) return
+    setBusy(true)
     try {
-      await api.applyPreset(name, target)
-      show('ok', `已切换到「${data?.presets.find((p) => p.name === name)?.title ?? name}」`)
-      setEditing(false)
-      refresh()
+      await api.applyPreset(pending.name, target)
+      show('ok', `已将「${pending.title}」应用到策略槽位 ${target}`)
+      setPending(null)
+      state.refresh()
     } catch (e) {
       show('err', e instanceof Error ? e.message : String(e))
     } finally {
-      setApplying(null)
+      setBusy(false)
     }
   }
-
-  const saveCustom = async () => {
-    try {
-      await api.putPolicy(target, filter, score)
-      show('ok', '表达式已生效')
-      setEditing(false)
-      refresh()
-    } catch (e) {
-      show('err', e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  if (loading) return <div className="empty">加载中…</div>
-  if (error) return <div className="empty">加载失败：{error}</div>
-  if (!data) return null
-
-  const policyNames = Object.keys(data.policies).sort()
 
   return (
     <>
-      <div className="page-head">
-        <div>
-          <h1>调度方案</h1>
-          <p className="page-desc">
-            一键切换调度算式，运行期立即生效（编译校验 → 持久化 → 集群广播），无需重启。
-          </p>
-        </div>
-        <div className="row">
-          <label style={{ margin: 0 }}>目标策略槽位</label>
-          <select
-            value={target}
-            onChange={(e) => {
-              setTarget(e.target.value)
-              setEditing(false)
-            }}
-            style={{ width: 'auto' }}
-          >
-            {policyNames.map((n) => (
-              <option key={n} value={n}>
-                {n}
-              </option>
-            ))}
-          </select>
-        </div>
-      </div>
+      <p className="page-desc">
+        调度方案决定请求在候选实例间的过滤与打分方式。切换会立即生效于所选策略槽位，并同步到持久层与集群其余实例。
+      </p>
 
-      <div className="card">
-        <h2>
-          当前生效：
-          {current?.preset === 'custom' ? (
-            <span className="badge warn">自定义表达式</span>
-          ) : (
-            <span className="badge accent">
-              {data.presets.find((p) => p.name === current?.preset)?.title ?? current?.preset}
-            </span>
-          )}
-        </h2>
-        <div className="field">
-          <label>过滤表达式 filter（返回 bool，false 淘汰该后端）</label>
-          <textarea
-            rows={2}
-            value={filter}
-            onChange={(e) => {
-              setFilter(e.target.value)
-              setEditing(true)
+      <Async state={state} skeletonRows={6}>
+        {(d) => (
+          <PresetsBody
+            data={d}
+            target={target}
+            onTarget={setTarget}
+            onPick={setPending}
+            onSaved={(msg) => {
+              show('ok', msg)
+              state.refresh()
             }}
+            onError={(msg) => show('err', msg)}
           />
-        </div>
-        <div className="field">
-          <label>打分表达式 score（数值，分数最小者胜出）</label>
-          <textarea
-            rows={3}
-            value={score}
-            onChange={(e) => {
-              setScore(e.target.value)
-              setEditing(true)
-            }}
-          />
-        </div>
-        <div className="row">
-          <button className="primary" onClick={saveCustom} disabled={!editing}>
-            保存自定义表达式
-          </button>
-          {editing && (
-            <button
-              onClick={() => {
-                setEditing(false)
-                if (current) {
-                  setFilter(current.filter)
-                  setScore(current.score)
-                }
-              }}
+        )}
+      </Async>
+
+      {pending && (
+        <ConfirmDialog
+          title="切换调度方案"
+          confirmText="确认切换"
+          busy={busy}
+          onCancel={() => setPending(null)}
+          onConfirm={apply}
+        >
+          <div>
+            即将把策略槽位 <code className="mono">{target}</code> 的过滤与打分表达式替换为「
+            {pending.title}」。
+          </div>
+          <div>
+            该操作对使用此槽位的全部模型路由立即生效，并广播到集群其余网关实例。原表达式不会自动保存，如需回退请重新选择方案或手工填写。
+          </div>
+          <pre className="expr">{pending.score}</pre>
+        </ConfirmDialog>
+      )}
+      <Toast toast={toast} />
+    </>
+  )
+}
+
+function PresetsBody({
+  data,
+  target,
+  onTarget,
+  onPick,
+  onSaved,
+  onError,
+}: {
+  data: PresetsResp
+  target: string
+  onTarget: (v: string) => void
+  onPick: (p: Preset) => void
+  onSaved: (msg: string) => void
+  onError: (msg: string) => void
+}) {
+  const slots = Object.keys(data.policies)
+  const current = data.policies[target]
+  const activePreset = current ? data.presets.find((p) => p.name === current.preset) : undefined
+
+  return (
+    <>
+      <Panel
+        title="当前生效方案"
+        tools={
+          <label className="switch">
+            策略槽位
+            <select
+              aria-label="策略槽位"
+              style={{ width: 140 }}
+              value={target}
+              onChange={(e) => onTarget(e.target.value)}
             >
-              放弃修改
-            </button>
-          )}
-          <span className="hint">
-            可用变量：running / waiting / kv_usage / inflight / prefix_match / hit_rate /
-            gen_tps / ttft_ewma / preempt_rate / weight / prompt_len / raw[...] / vars[...]
-          </span>
-        </div>
-      </div>
-
-      <h2 style={{ fontSize: 15, margin: '22px 0 12px' }}>内置方案</h2>
-      <div className="grid">
-        {data.presets.map((p) => {
-          const active = current?.preset === p.name
-          return (
-            <div key={p.name} className={active ? 'preset-card active' : 'preset-card'}>
-              <div className="preset-title">
-                {p.title}
-                {active && <span className="badge accent">生效中</span>}
+              {slots.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
+        }
+      >
+        {!current ? (
+          <StateBlock title={`策略槽位 ${target} 不存在`} detail="请在下拉框中选择已配置的槽位。" />
+        ) : (
+          <div className="stack">
+            <div className="row">
+              {activePreset ? (
+                <span className="badge ok">
+                  <Icon name="check" size={12} />
+                  {activePreset.title}
+                </span>
+              ) : (
+                <span className="badge accent">自定义表达式</span>
+              )}
+              <span className="hint">
+                {activePreset?.description ?? '当前表达式与任何内置方案都不匹配，由手工热更新写入。'}
+              </span>
+            </div>
+            <div className="cols-2">
+              <div>
+                <label>过滤表达式 filter</label>
+                <pre className="expr">{current.filter || '（空：不过滤候选实例）'}</pre>
               </div>
-              <div className="preset-desc">{p.description}</div>
-              <div className="expr">filter: {p.filter}</div>
-              <div className="expr">score: {p.score}</div>
-              <div className="row">
-                <button
-                  className={active ? '' : 'primary'}
-                  disabled={active || applying !== null}
-                  onClick={() => apply(p.name)}
-                >
-                  {active ? '当前方案' : applying === p.name ? '切换中…' : `应用到 ${target}`}
-                </button>
+              <div>
+                <label>打分表达式 score</label>
+                <pre className="expr">{current.score}</pre>
               </div>
             </div>
-          )
-        })}
-      </div>
+          </div>
+        )}
+      </Panel>
 
-      <Toast toast={toast} />
+      <Panel title="内置方案" subtitle={`应用到 ${target}`}>
+        <div className="preset-list">
+          {data.presets.map((p) => {
+            const active = current?.preset === p.name
+            return (
+              <div className={active ? 'preset-row active' : 'preset-row'} key={p.name}>
+                <div className="meta">
+                  <h3>
+                    {p.title}
+                    <code className="mono hint">{p.name}</code>
+                    {active && <span className="badge ok">已生效</span>}
+                  </h3>
+                  <p>{p.description}</p>
+                  <pre className="expr" style={{ marginTop: 8 }}>
+                    {p.score}
+                  </pre>
+                </div>
+                <button className="btn primary" disabled={active} onClick={() => onPick(p)}>
+                  {active ? '当前方案' : '应用'}
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      </Panel>
+
+      {current && (
+        <PolicyEditor
+          key={target}
+          target={target}
+          filter={current.filter}
+          score={current.score}
+          onSaved={onSaved}
+          onError={onError}
+        />
+      )}
     </>
   )
 }

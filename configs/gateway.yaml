@@ -2,7 +2,8 @@
 # 完整字段说明见 configs/README.md 与各模块 README。
 
 server:
-  listen: ":8080"
+  listen: "127.0.0.1:8080"           # 默认仅本机回环；对外暴露改 0.0.0.0:8080
+  admin_token: "change-me"           # 必填：管理面 /admin/* 的 Bearer 令牌，未配置拒绝启动
   max_body_bytes: 33554432          # 32MiB，omni 多模态请求体较大时按需调高
   retries: 2                        # 未写出首字节前的换后端重试次数
   upstream_connect_timeout: 3s

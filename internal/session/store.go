@@ -89,6 +89,20 @@ func (s *Store) Bind(key, backendID string) {
 	sh.m[key] = entry{backendID: backendID, expiresAt: now + s.ttl.Nanoseconds()}
 }
 
+// Unbind 移除指定会话的绑定（幂等：不存在即无操作）。
+// 供失效绑定清理路径使用：Lookup 命中指向已摘除/不可用后端的绑定、
+// 或主动解绑某会话时调用。共享存储（cluster.SessionStore）同时删除
+// Redis 侧键。
+func (s *Store) Unbind(key string) {
+	if key == "" {
+		return
+	}
+	sh := s.shardOf(key)
+	sh.mu.Lock()
+	delete(sh.m, key)
+	sh.mu.Unlock()
+}
+
 // InvalidateBackend 后端下线/摘除时批量解绑其全部会话。
 func (s *Store) InvalidateBackend(backendID string) {
 	for _, sh := range s.shards {

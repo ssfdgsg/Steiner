@@ -1,5 +1,7 @@
 # internal/backend/ — 后端抽象与注册表
 
+> 🌐 [English](README.en.md) | 简体中文
+
 ## 职责
 - `Backend`：单个推理后端实例的统一抽象，运行态（在途数、健康、隔离、熔断、
   指标快照、PromQL 变量）全部原子操作，调度热路径无锁读取；

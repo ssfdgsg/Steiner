@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"ai-gateway/internal/config"
@@ -22,13 +23,29 @@ const (
 	OutcomeDropped = "dropped" // 队列满被丢弃
 )
 
+// targetQueueSize 每个 webhook 目标的独立有界队列容量。
+const targetQueueSize = 64
+
 // Notifier 管理全部 webhook 目标并异步投递事件。
+//
+// 每个目标有独立的有界队列与专属 worker goroutine：一个慢/挂死的 webhook
+// 只阻塞自己的队列与 worker，不会队头阻塞其他目标；队列满时直接丢弃新事件
+// 并记录（投递永不阻塞产生事件的求值循环）。
 type Notifier struct {
 	targets  map[string]config.WebhookConfig
 	order    []string // 保持配置顺序，便于测试与日志稳定
-	queue    chan delivery
+	queues   map[string]chan delivery
 	client   *http.Client
 	onResult func(target, outcome string) // 指标回调，可为 nil
+
+	// M13 连续 firing 去重：告警状态机在 leader 翻转/重启后重置，同一规则
+	// 持续触发时会产生"重复 firing"（中间无 resolved）。窗口内（默认 5m，
+	// SetDedupeWindow 装配期配置）同一 (类型,规则,实例) 的连续 firing 通知
+	// 最多一条；resolved 通知重置窗口。窗口为 0 表示关闭（例如规则启用了
+	// repeat_interval 且需要更快重发时）。
+	dedupeMu     sync.Mutex
+	dedupeWindow time.Duration
+	dedupe       map[string]time.Time // key: Type|Rule|Instance → 最近一次 firing
 }
 
 type delivery struct {
@@ -36,32 +53,85 @@ type delivery struct {
 	target string
 }
 
+// SetDedupeWindow 装配期设置连续 firing 去重窗口（0 = 关闭）。
+func (n *Notifier) SetDedupeWindow(w time.Duration) {
+	n.dedupeMu.Lock()
+	n.dedupeWindow = w
+	n.dedupeMu.Unlock()
+}
+
 // NewNotifier 构造通知器。onResult 用于上报投递结果指标，可传 nil。
 func NewNotifier(cfgs []config.WebhookConfig, onResult func(target, outcome string)) *Notifier {
 	n := &Notifier{
 		targets:  make(map[string]config.WebhookConfig, len(cfgs)),
-		queue:    make(chan delivery, 256),
+		queues:   make(map[string]chan delivery, len(cfgs)),
 		client:   &http.Client{},
 		onResult: onResult,
+		dedupe:   map[string]time.Time{},
 	}
 	for _, c := range cfgs {
 		n.targets[c.Name] = c
+		n.queues[c.Name] = make(chan delivery, targetQueueSize)
 		n.order = append(n.order, c.Name)
 	}
 	return n
 }
 
-// Send 将事件投递到指定目标；targets 为空表示全部目标。非阻塞。
+// dedupeSkip 判定事件是否被 M13 去重窗拦截：同一 (Type,Rule,Instance) 在
+// 窗口内再次 firing（上一次也是 firing 且中间无 resolved）→ 拦截；
+// resolved → 清除记录并放行（下一条 firing 视为新事件）。
+func (n *Notifier) dedupeSkip(ev Event) bool {
+	n.dedupeMu.Lock()
+	defer n.dedupeMu.Unlock()
+	if n.dedupeWindow <= 0 {
+		return false
+	}
+	key := ev.Type + "|" + ev.Rule + "|" + ev.Instance
+	if ev.Status == StatusResolved {
+		delete(n.dedupe, key)
+		return false
+	}
+	if ev.Status != StatusFiring {
+		return false
+	}
+	now := time.Now()
+	if last, ok := n.dedupe[key]; ok && now.Sub(last) < n.dedupeWindow {
+		return true
+	}
+	n.dedupe[key] = now
+	return false
+}
+
+// Send 将事件投递到指定目标；targets 为空表示全部目标。非阻塞：
+// 目标队列满时丢弃新事件并记录 OutcomeDropped。
+//
+// L8 重复目标去重（运行时）：同一目标在投递列表中被重复引用
+// （规则/全局配置里同 name 或同 URL 写了多次）时只投递一次，
+// 保持首次出现顺序。去重身份取目标 URL——同名必然同 URL，
+// 异名同 URL 也视为同一 webhook 端点，避免对同一端点重复投递；
+// 不在配置层 Validate 报错，以兼容现有配置。
 func (n *Notifier) Send(ev Event, targets []string) {
+	// M13：连续 firing 去重（无 resolved 间隔的重复 firing 窗口内只发一条）。
+	// resolved 通知必须放行（重置窗口）。
+	if n.dedupeSkip(ev) {
+		return
+	}
 	if len(targets) == 0 {
 		targets = n.order
 	}
+	seen := make(map[string]bool, len(targets))
 	for _, t := range targets {
-		if _, ok := n.targets[t]; !ok {
+		cfg, ok := n.targets[t]
+		if !ok {
 			continue // 配置校验已保证引用合法，这里兜底跳过
 		}
+		if seen[cfg.URL] {
+			continue // L8：同一 URL 目标只投递一次
+		}
+		seen[cfg.URL] = true
+		q := n.queues[t]
 		select {
-		case n.queue <- delivery{ev: ev, target: t}:
+		case q <- delivery{ev: ev, target: t}:
 		default:
 			slog.Warn("webhook 队列已满，事件被丢弃", "target", t, "type", ev.Type, "rule", ev.Rule)
 			n.report(t, OutcomeDropped)
@@ -69,13 +139,22 @@ func (n *Notifier) Send(ev Event, targets []string) {
 	}
 }
 
-// Run 消费队列并投递，直到 ctx 取消。单 worker 串行发送即可满足告警量级。
+// Run 启动每个目标的投递 worker 并阻塞，直到 ctx 取消。
 func (n *Notifier) Run(ctx context.Context) {
+	for _, name := range n.order {
+		go n.runTarget(ctx, n.queues[name])
+	}
+	<-ctx.Done()
+}
+
+// runTarget 单个目标的投递 worker：串行消费该目标队列，失败按目标配置
+// 独立指数退避重试，互不影响其他目标。
+func (n *Notifier) runTarget(ctx context.Context, queue chan delivery) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case d := <-n.queue:
+		case d := <-queue:
 			n.deliver(ctx, d)
 		}
 	}

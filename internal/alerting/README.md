@@ -1,5 +1,7 @@
 # internal/alerting/ — 指标告警与自动扩缩容建议
 
+> 🌐 [English](README.en.md) | 简体中文
+
 ## 职责
 1. **webhook 通知器**（`notifier.go`）：异步队列投递、指数退避重试、五种消息模板（generic 原始 JSON / 钉钉 / 飞书 / 企业微信 / Slack）；
 2. **告警规则引擎**（`rules.go`）：expr 布尔表达式周期求值，Prometheus 风格状态机
