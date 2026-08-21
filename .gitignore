@@ -8,6 +8,7 @@
 *.prof
 coverage.out
 /.gocache/
+/dist/ca-certificates.crt
 
 # Frontend dependencies and local build cache
 /web/node_modules/
